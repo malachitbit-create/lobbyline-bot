@@ -5,3 +5,4 @@ logs/
 media/
 __pycache__/
 __pycache__/
+state.json.seed_id
