@@ -1493,7 +1493,7 @@ def on_update(u):
                 t0 = msg.get("text") or ""
                 is_card = msg.get("via_bot", {}).get("id") == BOT_ID[0] and t0.startswith("🗳 Голос за")
                 # any other message sent through our inline mode (e.g. «🎮 Тема про … уже есть») lives 60 s
-                is_notice = msg.get("via_bot", {}).get("id") == BOT_ID[0] and not is_card
+                is_notice = msg.get("via_bot", {}).get("id") == BOT_ID[0] and not is_card and "Тема про" in t0
                 if is_notice: del_later(msg["chat"]["id"], msg["message_id"], 60)
                 if is_card:  # stays until its sender votes; safety delete after 60 s
                     del_later(msg["chat"]["id"], msg["message_id"], 60, f"{msg.get('from', {}).get('id')}:{_nt(t0.split(chr(10))[0][len('🗳 Голос за'):])}")
