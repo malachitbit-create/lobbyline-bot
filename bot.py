@@ -909,22 +909,32 @@ def has_topic(s, title, appid=None): return topic_entry(s, title) is not None
 def topic_link(s, th):
     g = s.get("group")
     return f"https://t.me/c/{str(g)[4:] if str(g).startswith('-100') else str(g).lstrip('-')}/{th}" if g and th else None
-def topic_button(s, title):
+def topic_button(s, title, with_icon=False):
     """Inline URL button straight into the topic, or None if its thread id is unknown."""
     te = topic_entry(s, title)
     if not te: return None
     k, e = te; ln = topic_link(s, e.get("th"))
-    return {"inline_keyboard": [[{"text": f"Жми сюда 👉 🎮 {k}", "url": ln}]]} if ln else None
+    if not ln: return None
+    b = {"text": f"Жми сюда 👉 {game_emoji(k)} {k}", "url": ln}
+    if e.get("icon") and with_icon: b = {"text": f"Жми сюда 👉 {k}", "url": ln, "icon_custom_emoji_id": e["icon"]}
+    return {"inline_keyboard": [[b]]}
+GAME_EMOJI = {"dota2": "🧙", "cs2": "🔫", "counterstrike2": "🔫", "fortnite": "🪂", "valorant": "🎯", "worldoftanks": "🪖",
+              "hearthstone": "🃏", "overwatch": "🦸", "overwatch2": "🦸", "gta5": "🚗", "gtav": "🚗", "thefinals": "💥"}
+def game_emoji(name): return GAME_EMOJI.get(_tk(name), "🎮")
 def topic_jump_msg(chat, title):
     """Short notice with a jump button; removed after 60 s (vote not counted, wallet untouched)."""
-    s = load_state(); te = topic_entry(s, title); k = te[0] if te else title; kb = topic_button(s, title)
-    j = tg("sendMessage", chat_id=chat, text=f"У игры «{k}» уже есть своя тема в чате — голос не засчитан и не списан, можно проголосовать за другую игру.",
-           disable_notification=True, **({"reply_markup": kb} if kb else {}))
+    s = load_state(); te = topic_entry(s, title); k = te[0] if te else title
+    text = f"У игры «{k}» уже есть своя тема в чате — голос не засчитан и не списан, можно проголосовать за другую игру."
+    kb = topic_button(s, title, with_icon=True)  # topic's own custom-emoji icon (needs Premium owner / Fragment username)
+    j = tg("sendMessage", chat_id=chat, text=text, disable_notification=True, **({"reply_markup": kb} if kb else {}))
+    if not j.get("ok") and kb and "icon_custom_emoji_id" in json.dumps(kb):
+        log.info("button icon rejected (%s), using emoji", j.get("description"))
+        j = tg("sendMessage", chat_id=chat, text=text, disable_notification=True, reply_markup=topic_button(s, title))
     if j.get("ok"): del_later(chat, j["result"]["message_id"], 60)
 def topic_notice(s, title):
     """HTML notice with the topic icon (custom emoji if known) and a direct link."""
     k, e = topic_entry(s, title); ln = topic_link(s, e.get("th")); ic = e.get("icon")
-    icon = f'<tg-emoji emoji-id="{ic}">🎮</tg-emoji>' if ic else "🎮"
+    icon = f'<tg-emoji emoji-id="{ic}">{game_emoji(k)}</tg-emoji>' if ic else game_emoji(k)
     name = html.escape(k)
     return f"Тема про <b>{name}</b> уже есть в чате.\n" + (f'Жми сюда 👉 {icon} <a href="{ln}">{name}</a>' if ln else f"Ищи её в списке тем 👉 {icon} {name}")
 def epic_search(term):
@@ -1622,8 +1632,8 @@ def main():
     threading.Thread(target=autodel_loop, daemon=True).start()
     with lock:
         s0 = load_state(); migrate_wallets(s0); existing_topics(s0); rf = refund_topic_votes(s0); save_state(s0)
-    log.info("topic-vote audit: refunded %s; topics without thread id: %s", rf or "nothing",
-             [k for k, e in s0.get("existing_topics", {}).items() if not e.get("th")])
+    log.info("topic-vote audit: refunded %s; topics: %s", rf or "nothing",
+             {k: (e.get("th"), "icon" if e.get("icon") else "no-icon") for k, e in s0.get("existing_topics", {}).items()})
     BOT_ID[0] = tg("getMe").get("result", {}).get("id")
     g0 = load_state().get("group")
     if g0: tg("setMyCommands", commands=GROUP_CMDS, scope={"type": "chat", "chat_id": g0})
