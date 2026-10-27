@@ -1664,6 +1664,9 @@ def main():
         s1 = load_state(); et = s1.get("existing_topics", {})
         for k in [k for k in et if _tk(k) == _tk(VOTE_TOPIC_NAME) or et[k].get("th") == s1.get("vote_thread")]: et.pop(k)
         with lock: s2 = load_state(); s2["existing_topics"] = et; save_state(s2)
+        log.info("vote area: thread %s, statspost %s", s2.get("vote_thread"), s2.get("statspost"))
+        if s2.get("vote_thread") and (s2.get("statspost") or {}).get("th") != s2.get("vote_thread"):
+            threading.Thread(target=run_job, args=("chart", publish_stats), kwargs={"limit": 180}, daemon=True).start()
     except Exception: log.exception("vote topic")
     BOT_ID[0] = tg("getMe").get("result", {}).get("id")
     g0 = load_state().get("group")
