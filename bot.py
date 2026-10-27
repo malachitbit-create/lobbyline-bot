@@ -31,11 +31,13 @@ load_env("/home/box/tg/bot.env"); load_env(os.path.join(BASE, "gemini.env"))  # 
 def _seed_state():
     """First start on a new host: restore state.json from the encrypted seed shipped with the code."""
     seed = os.path.join(BASE, "state_seed.enc")
-    if os.path.exists(STATE) or not os.path.exists(seed) or not os.environ.get("STATE_KEY"): return
+    if not os.path.exists(seed) or not os.environ.get("STATE_KEY"): return
+    sid = hashlib.md5(open(seed, "rb").read()).hexdigest(); mark = STATE + ".seed_id"
+    if os.path.exists(mark) and open(mark).read().strip() == sid: return  # this seed was already applied once
     from cryptography.fernet import Fernet
     import gzip
     data = gzip.decompress(Fernet(os.environ["STATE_KEY"].encode()).decrypt(open(seed, "rb").read()))
-    json.loads(data); open(STATE, "wb").write(data); print("state.json restored from seed", flush=True)
+    json.loads(data); open(STATE, "wb").write(data); open(mark, "w").write(sid); print("state.json restored from seed", sid, flush=True)
 _seed_state()
 TOKEN = os.environ["BOT_TOKEN"]; GKEY = os.environ["GEMINI_API_KEY"]
 API = f"https://api.telegram.org/bot{TOKEN}/"
