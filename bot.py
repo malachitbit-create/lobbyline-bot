@@ -938,7 +938,8 @@ def topic_notice(s, title):
     k, e = topic_entry(s, title); ln = topic_link(s, e.get("th")); ic = e.get("icon")
     icon = f'<tg-emoji emoji-id="{ic}">{game_emoji(k)}</tg-emoji>' if ic else game_emoji(k)
     name = html.escape(k)
-    return f"Тема про <b>{name}</b> уже есть в чате.\n" + (f'Жми сюда 👉 {icon} <a href="{ln}">{name}</a>' if ln else f"Ищи её в списке тем 👉 {icon} {name}")
+    # the jump link lives in the button under the message («Жми сюда 👉 …»), not in the text
+    return f"Тема про <b>{name}</b> уже есть в чате." + ("" if ln else f"\nИщи её в списке тем 👉 {icon} {name}")
 def epic_search(term):
     try:
         r = requests.get("https://store.epicgames.com/graphql", headers=BUA, timeout=6, params={
