@@ -516,6 +516,8 @@ def handle_group(msg, s):
     if ftc and th and not ftc.get("name") and ftc.get("icon_custom_emoji_id") and chat["id"] == s.get("group"):
         e = next((x for x in existing_topics(s).values() if x.get("th") == th), None)
         if e: e["icon"] = ftc["icon_custom_emoji_id"]; changed = True
+    if th and th == s.get("vote_thread"): ftc = None; rt_skip = True
+    else: rt_skip = False
     if ftc and th and ftc.get("name") and chat["id"] == s.get("group"):
         et = existing_topics(s)
         old = next((k for k, x in et.items() if x.get("th") == th), None)  # renamed topic
@@ -527,7 +529,7 @@ def handle_group(msg, s):
         g = norm_game(ftc["name"])
         if g: s.setdefault("topics", {})[g] = th; changed = True; log.info("topic %s -> %s", g, th)
     rt = msg.get("reply_to_message", {}).get("forum_topic_created")
-    if rt and th and rt.get("name") and chat["id"] == s.get("group") and msg.get("is_topic_message"):
+    if rt and th and not rt_skip and rt.get("name") and _tk(rt["name"]) != _tk(VOTE_TOPIC_NAME) and chat["id"] == s.get("group") and msg.get("is_topic_message"):
         et = existing_topics(s); nm = rt["name"].strip()
         k = next((k for k in et if _tk(k) == _tk(nm)), nm); e = et.setdefault(k, {"th": None, "aliases": []})
         if e.get("th") != th or (rt.get("icon_custom_emoji_id") and not e.get("icon")):
@@ -926,10 +928,10 @@ def topic_jump_msg(chat, title):
     s = load_state(); te = topic_entry(s, title); k = te[0] if te else title
     text = f"У игры «{k}» уже есть своя тема в чате — голос не засчитан и не списан, можно проголосовать за другую игру."
     kb = topic_button(s, title, with_icon=True)  # topic's own custom-emoji icon (needs Premium owner / Fragment username)
-    j = tg("sendMessage", chat_id=chat, text=text, disable_notification=True, **({"reply_markup": kb} if kb else {}))
+    j = tg("sendMessage", chat_id=chat, text=text, disable_notification=True, **_thr(chat, s), **({"reply_markup": kb} if kb else {}))
     if not j.get("ok") and kb and "icon_custom_emoji_id" in json.dumps(kb):
         log.info("button icon rejected (%s), using emoji", j.get("description"))
-        j = tg("sendMessage", chat_id=chat, text=text, disable_notification=True, reply_markup=topic_button(s, title))
+        j = tg("sendMessage", chat_id=chat, text=text, disable_notification=True, reply_markup=topic_button(s, title), **_thr(chat, s))
     if j.get("ok"): del_later(chat, j["result"]["message_id"], 60)
 def topic_notice(s, title):
     """HTML notice with the topic icon (custom emoji if known) and a direct link."""
@@ -1137,7 +1139,7 @@ BOT_ID = [None]
 FONT = os.path.join(ASSETS, "fonts", "DejaVuSans.ttf"); FONTB = os.path.join(ASSETS, "fonts", "DejaVuSans-Bold.ttf")
 TRACK_EVERY = 1800
 def buffer_msg(msg):
-    if msg.get("is_topic_message") or msg.get("from", {}).get("is_bot"): return
+    if msg.get("from", {}).get("is_bot") or not in_vote_area(msg, load_state()): return
     txt = (msg.get("text") or msg.get("caption") or "").strip()
     if not txt or txt.startswith("/") or txt.startswith("🗳 Голос за"): return
     with lock:
@@ -1293,7 +1295,28 @@ def autodel_loop():
                     tg("deleteMessage", chat_id=e["c"], message_id=e["m"])
                     log.info("autodel %s after %.0fs", e["m"], time.time() - e.get("at", time.time()))
         except Exception: log.exception("autodel")
+VOTE_TOPIC_NAME = "Голосовалка"; VOTE_TOPIC_ICON = "5350387571199319521"  # 🗳
+def vote_thread(s=None): return (s or load_state()).get("vote_thread")
+def in_vote_area(msg, s):
+    """The voting area is the «Голосовалка» topic of the bound group (General is no longer used)."""
+    vt = s.get("vote_thread")
+    return bool(vt) and msg["chat"]["id"] == s.get("group") and msg.get("is_topic_message") and msg.get("message_thread_id") == vt
+def _thr(chat, s=None):
+    s = s or load_state(); vt = s.get("vote_thread")
+    return {"message_thread_id": vt} if vt and chat == s.get("group") else {}
+def ensure_vote_topic():
+    with lock:
+        s = load_state()
+        if s.get("vote_thread") or not s.get("group"): return s.get("vote_thread")
+    j = tg("createForumTopic", chat_id=s["group"], name=VOTE_TOPIC_NAME, icon_custom_emoji_id=VOTE_TOPIC_ICON)
+    if not j.get("ok"): log.warning("createForumTopic failed: %s", j.get("description")); return None
+    th = j["result"]["message_thread_id"]
+    with lock:
+        s = load_state(); s["vote_thread"] = th; s["stats_dirty"] = True; s["stats_at"] = 0
+        s["statspost_general_old"] = s.pop("statspost", None); save_state(s)
+    log.info("vote topic created: %s", th); return th
 def greply(chat, **kw):
+    kw = {**_thr(chat), **kw}
     j = tg("sendMessage", chat_id=chat, disable_notification=True, **kw)
     if j.get("ok"): del_later(chat, j["result"]["message_id"])
     return j
@@ -1313,7 +1336,7 @@ def group_cmd(msg, s, cmd):
         return threading.Thread(target=_stats_reply, args=(chat, s), daemon=True).start()
 def _stats_reply(chat, s):
     if True:
-        j = tg("sendPhoto", files={"photo": ("gamestats.png", render_stats(s), "image/png")}, chat_id=chat, caption=stats_caption(s), parse_mode="HTML", disable_notification=True)
+        j = tg("sendPhoto", files={"photo": ("gamestats.png", render_stats(s), "image/png")}, chat_id=chat, caption=stats_caption(s), parse_mode="HTML", disable_notification=True, **_thr(chat, s))
         if j.get("ok"): del_later(chat, j["result"]["message_id"])
 def on_stats_btn(q, s, act):
     if act == "me":
@@ -1335,8 +1358,9 @@ def stats_caption(s):
         "<i>Обновляется раз в 30 минут · меню команд у поля ввода</i>")
 
 def publish_stats(force=False):
-    s = load_state(); sp = s.get("statspost"); grp = s.get("group")
-    if not grp: return
+    s = load_state(); sp = s.get("statspost"); grp = s.get("group"); vt = s.get("vote_thread")
+    if not grp or not vt: return
+    if sp and sp.get("th") != vt: sp = None  # old General post (43) is left alone
     png = render_stats(s); cap = stats_caption(s)
     if sp and sp.get("chat") == grp:
         j = tg("editMessageMedia", files={"p": ("gamestats.png", png, "image/png")}, chat_id=grp, message_id=sp["mid"],
@@ -1344,9 +1368,9 @@ def publish_stats(force=False):
         if j.get("ok") or "not modified" in (j.get("description") or ""): ok = True
         else: ok = False; sp = None
     if not sp:
-        j = tg("sendPhoto", files={"photo": ("gamestats.png", png, "image/png")}, chat_id=grp, caption=cap, parse_mode="HTML", disable_notification=True, reply_markup=STATS_MARKUP)
+        j = tg("sendPhoto", files={"photo": ("gamestats.png", png, "image/png")}, chat_id=grp, message_thread_id=vt, caption=cap, parse_mode="HTML", disable_notification=True, reply_markup=STATS_MARKUP)
         if not j.get("ok"): return
-        sp = {"chat": grp, "mid": j["result"]["message_id"]}
+        sp = {"chat": grp, "mid": j["result"]["message_id"], "th": vt}
         tg("pinChatMessage", chat_id=grp, message_id=sp["mid"], disable_notification=True)
     with lock:
         s = load_state(); s["statspost"] = sp; s["stats_dirty"] = False; s["stats_at"] = time.time(); save_state(s)
@@ -1508,13 +1532,13 @@ def on_update(u):
                 if is_card:  # stays until its sender votes; safety delete after 60 s
                     del_later(msg["chat"]["id"], msg["message_id"], 60, f"{msg.get('from', {}).get('id')}:{_nt(t0.split(chr(10))[0][len('🗳 Голос за'):])}")
                 gc = t0.split()[0].split("@")[0] if t0.startswith("/") else ""
-                if gc in ("/vote", "/top", "/voters", "/stats", "/myvote") and msg["chat"]["id"] == s.get("group"):
+                if gc in ("/vote", "/top", "/voters", "/stats", "/myvote") and in_vote_area(msg, s):
                     group_cmd(msg, load_state(), gc)
                 try: buffer_msg(msg)
                 except Exception: log.exception("buffer")
                 # keep General clean: everything except the pinned table is removed at once (inline vote cards too: the vote is counted on chosen_inline_result)
                 s2 = load_state(); sp = s2.get("statspost") or {}
-                if msg["chat"]["id"] == s2.get("group") and not msg.get("is_topic_message") and msg["message_id"] != sp.get("mid") and not is_card and not is_notice:
+                if in_vote_area(msg, s2) and msg["message_id"] != sp.get("mid") and not is_card and not is_notice:
                     tg("deleteMessage", chat_id=msg["chat"]["id"], message_id=msg["message_id"])
             return
         if s["owner"] is not None and not is_allowed(s, chat): return deny_dm(chat)
@@ -1634,6 +1658,12 @@ def main():
         s0 = load_state(); migrate_wallets(s0); existing_topics(s0); rf = refund_topic_votes(s0); save_state(s0)
     log.info("topic-vote audit: refunded %s; topics: %s", rf or "nothing",
              {k: (e.get("th"), "icon" if e.get("icon") else "no-icon") for k, e in s0.get("existing_topics", {}).items()})
+    try:
+        ensure_vote_topic()
+        s1 = load_state(); et = s1.get("existing_topics", {})
+        for k in [k for k in et if _tk(k) == _tk(VOTE_TOPIC_NAME) or et[k].get("th") == s1.get("vote_thread")]: et.pop(k)
+        with lock: s2 = load_state(); s2["existing_topics"] = et; save_state(s2)
+    except Exception: log.exception("vote topic")
     BOT_ID[0] = tg("getMe").get("result", {}).get("id")
     g0 = load_state().get("group")
     if g0: tg("setMyCommands", commands=GROUP_CMDS, scope={"type": "chat", "chat_id": g0})
