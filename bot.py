@@ -1261,7 +1261,7 @@ def del_later(chat, mid, sec=60, tag=None):
         if mid == sp.get("mid") and chat == sp.get("chat"): return
         e = next((e for e in q if e["c"] == chat and e["m"] == mid), None)
         if e: e["t"] = max(e["t"], time.time() + sec); e["tag"] = e.get("tag") or tag
-        else: q.append({"c": chat, "m": mid, "t": time.time() + sec, "tag": tag})
+        else: q.append({"c": chat, "m": mid, "t": time.time() + sec, "tag": tag, "at": time.time()})
         save_state(s)
 def bump_tag(tag, sec=60):
     with lock:
@@ -1279,7 +1279,9 @@ def autodel_loop():
                 s["autodel"] = [e for e in s["autodel"] if e["t"] > now]; save_state(s)
             sp = s.get("statspost") or {}
             for e in due:
-                if not (e["m"] == sp.get("mid") and e["c"] == sp.get("chat")): tg("deleteMessage", chat_id=e["c"], message_id=e["m"])
+                if not (e["m"] == sp.get("mid") and e["c"] == sp.get("chat")):
+                    tg("deleteMessage", chat_id=e["c"], message_id=e["m"])
+                    log.info("autodel %s after %.0fs", e["m"], time.time() - e.get("at", time.time()))
         except Exception: log.exception("autodel")
 def greply(chat, **kw):
     j = tg("sendMessage", chat_id=chat, disable_notification=True, **kw)
@@ -1490,8 +1492,9 @@ def on_update(u):
                 handle_group(msg, s)
                 t0 = msg.get("text") or ""
                 is_card = msg.get("via_bot", {}).get("id") == BOT_ID[0] and t0.startswith("🗳 Голос за")
-                if msg.get("via_bot", {}).get("id") == BOT_ID[0] and t0.startswith("Тема про"):
-                    del_later(msg["chat"]["id"], msg["message_id"], 60); is_card = True
+                # any other message sent through our inline mode (e.g. «🎮 Тема про … уже есть») lives 60 s
+                is_notice = msg.get("via_bot", {}).get("id") == BOT_ID[0] and not is_card
+                if is_notice: del_later(msg["chat"]["id"], msg["message_id"], 60)
                 if is_card:  # stays until its sender votes; safety delete after 60 s
                     del_later(msg["chat"]["id"], msg["message_id"], 60, f"{msg.get('from', {}).get('id')}:{_nt(t0.split(chr(10))[0][len('🗳 Голос за'):])}")
                 gc = t0.split()[0].split("@")[0] if t0.startswith("/") else ""
@@ -1501,7 +1504,7 @@ def on_update(u):
                 except Exception: log.exception("buffer")
                 # keep General clean: everything except the pinned table is removed at once (inline vote cards too: the vote is counted on chosen_inline_result)
                 s2 = load_state(); sp = s2.get("statspost") or {}
-                if msg["chat"]["id"] == s2.get("group") and not msg.get("is_topic_message") and msg["message_id"] != sp.get("mid") and not is_card:
+                if msg["chat"]["id"] == s2.get("group") and not msg.get("is_topic_message") and msg["message_id"] != sp.get("mid") and not is_card and not is_notice:
                     tg("deleteMessage", chat_id=msg["chat"]["id"], message_id=msg["message_id"])
             return
         if s["owner"] is not None and not is_allowed(s, chat): return deny_dm(chat)
