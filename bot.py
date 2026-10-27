@@ -1080,7 +1080,7 @@ def on_vote_owner(q, s, act, gid):
     tg("sendMessage", chat_id=chat, text=f"✅ Тема «{g['title']}» создана ({th}) и добавлена в список тем")
 
 # ---------- handlers ----------
-HELP = ("Я готовлю черновики постов для @lobbyline.\n/draft — сделать черновик сейчас\n/updates — последние официальные обновления игр\n/memes — мемы на одобрение\n/topics — темы чата\n/votepost — (в General) обновить закреплённую таблицу\n/gamestats — таблица «Какие игры просят» в личку\n/allow id|@ник — открыть доступ к боту в личке\n/deny id — закрыть доступ\n/allowed — список допущенных\n/help — помощь\n"
+HELP = ("Я готовлю черновики постов для @lobbyline.\n/draft — сделать черновик сейчас\n/updates — последние официальные обновления игр\n/memes — мемы на одобрение\n/topics — темы чата\n/votepost — (в General) обновить закреплённую таблицу\n/gamestats — таблица «Какие игры просят» в личку\nЛюбой текст или /ask — вопрос к Gemini, /new — новый диалог\n/allow id|@ник — открыть доступ к боту в личке\n/deny id — закрыть доступ\n/allowed — список допущенных\n/help — помощь\n"
         "Автоматически: 10:00, 15:00, 20:00 (Екб); патчноуты проверяются каждые 30 мин. Ничего не публикуется без кнопки ✅.")
 # ---------- game mention tracker (General topic memory) ----------
 BOT_ID = [None]
@@ -1345,6 +1345,96 @@ def wl_cmd(msg, s, txt):
         save_state(s)
     tg("sendMessage", chat_id=chat, text=("✅ Доступ открыт: " if cmd == "/allow" else "🚫 Доступ закрыт: ") + str(uid))
 
+# ---- Gemini chat in private DM (owner + whitelist) ----
+CHAT_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash"]   # separate from the lite models used by the batch jobs
+CHAT_SYS = ("Ты — помощник Lobby Line в Telegram. Отвечай по-русски (если не просят иначе), по делу и дружелюбно. "
+            "Форматирование: только **жирный**, `код` и блоки ```кода```, без таблиц и заголовков #.")
+CHAT_HIST = {}          # uid -> [{"role": "user"|"model", "parts": [{"text": ...}]}], last 10 turns, in memory
+CHAT_BUSY = {}          # uid -> True while a reply is being generated
+CHAT_DOWN = {}          # model -> time until which it's skipped after 429
+def _chat_gemini(uid, text):
+    hist = CHAT_HIST.setdefault(uid, [])
+    contents = hist + [{"role": "user", "parts": [{"text": text}]}]
+    last = None
+    for m in CHAT_MODELS:
+        if CHAT_DOWN.get(m, 0) > time.time(): last = 429; continue
+        for attempt in range(2):
+            try:
+                r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                    headers={"x-goog-api-key": GKEY}, timeout=(10, 45 if m == CHAT_MODELS[0] else 90), json={"contents": contents,
+                    "systemInstruction": {"parts": [{"text": CHAT_SYS}]}, "generationConfig": {"temperature": 0.7}})
+            except requests.RequestException as e: last = type(e).__name__; CHAT_DOWN[m] = time.time() + 120; break
+            if r.status_code == 200:
+                parts = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                ans = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+                if not ans: last = "empty"; break
+                hist += [{"role": "user", "parts": [{"text": text}]}, {"role": "model", "parts": [{"text": ans}]}]
+                del hist[:-20]; return ans, m
+            last = r.status_code
+            if r.status_code == 429: CHAT_DOWN[m] = time.time() + 300; break
+            if r.status_code in (500, 503) and attempt == 0: time.sleep(2); continue
+            if r.status_code in (500, 503): CHAT_DOWN[m] = time.time() + 120
+            break
+        log.warning("chat %s -> %s", m, last)
+    raise RuntimeError(str(last))
+def _md_to_html(t):
+    out, parts = [], re.split(r"```(?:[\w+-]*\n)?(.*?)```", t, flags=re.S)
+    for i, p in enumerate(parts):
+        if i % 2: out.append("<pre>" + html.escape(p.strip("\n")) + "</pre>"); continue
+        p = html.escape(p)
+        p = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", p)
+        p = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", p, flags=re.S)
+        p = re.sub(r"(?m)^#{1,6}\s*(.+)$", r"<b>\1</b>", p)
+        out.append(p)
+    return "".join(out)
+def _split(text, n=3500):
+    """Split into chunks <= n chars on line breaks, keeping ``` blocks balanced per chunk."""
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > n: 
+            if cur: chunks.append(cur); cur = ""
+            chunks.append(line[:n]); line = line[n:]
+        if len(cur) + len(line) + 1 > n: chunks.append(cur); cur = ""
+        cur += line + "\n"
+    if cur.strip(): chunks.append(cur)
+    out, carry = [], False
+    for ch in chunks:
+        if carry: ch = "```\n" + ch
+        carry = ch.count("```") % 2 == 1
+        out.append(ch + ("```" if carry else ""))
+    return [x for x in out if x.strip()]
+def _send_long(chat, text):
+    for ch in _split(text):
+        j = tg("sendMessage", chat_id=chat, text=_md_to_html(ch), parse_mode="HTML", disable_web_page_preview=True)
+        if not j.get("ok"): tg("sendMessage", chat_id=chat, text=ch[:4096], disable_web_page_preview=True)
+def _chat_reply(chat, text):
+    if CHAT_BUSY.get(chat): return tg("sendMessage", chat_id=chat, text="Секунду, ещё думаю над прошлым сообщением ⏳")
+    CHAT_BUSY[chat] = True
+    stop = threading.Event()
+    def typing():
+        while not stop.is_set(): tg("sendChatAction", chat_id=chat, action="typing"); stop.wait(4.5)
+    threading.Thread(target=typing, daemon=True).start()
+    try:
+        ans, m = _chat_gemini(chat, text); log.info("chat %s via %s: %d chars", chat, m, len(ans))
+        stop.set(); _send_long(chat, ans)
+    except Exception as e:
+        stop.set(); log.warning("chat failed: %s", e)
+        msg = ("Лимит запросов к Gemini на сейчас исчерпан 😔 Попробуй через несколько минут." if "429" in str(e)
+               else "Gemini сейчас перегружен или недоступен 😔 Попробуй ещё раз чуть позже.")
+        tg("sendMessage", chat_id=chat, text=msg)
+    finally: stop.set(); CHAT_BUSY.pop(chat, None)
+def _chat_route(chat, txt):
+    """Plain text and /ask go to Gemini, /new resets history. Returns True if handled."""
+    cmd = txt.split(" ")[0].split("@")[0] if txt.startswith("/") else ""
+    if cmd == "/new":
+        CHAT_HIST.pop(chat, None); tg("sendMessage", chat_id=chat, text="🆕 Начали новый диалог. Пиши вопрос!"); return True
+    if cmd == "/ask":
+        q = txt.partition(" ")[2].strip()
+        if not q: tg("sendMessage", chat_id=chat, text="Напиши вопрос после команды: /ask как дела?"); return True
+    elif cmd or not txt.strip(): return False
+    else: q = txt.strip()
+    POOL.submit(_safe, "chat", _chat_reply, chat, q); return True
+
 def on_update(u):
     for k in ("message", "callback_query", "inline_query", "chosen_inline_result"):
         if k in u:
@@ -1376,8 +1466,9 @@ def on_update(u):
             return
         if s["owner"] is not None and not is_allowed(s, chat): return deny_dm(chat)
         if chat == s["owner"] and txt.split(" ")[0].split("@")[0] in ("/allow", "/deny", "/allowed"): return wl_cmd(msg, s, txt)
+        if s["owner"] is not None and _chat_route(chat, txt): return
         if chat != s["owner"] and s["owner"] is not None:
-            return tg("sendMessage", chat_id=chat, text="Привет! Доступ открыт ✅ Голосовать за игры можно в «Lobby Line Чат» через «🔍 Найти игру».")
+            return tg("sendMessage", chat_id=chat, text="Привет! Доступ открыт ✅ Пиши мне любой вопрос — отвечу через Gemini. /new — новый диалог.\nГолосовать за игры можно в «Лобби Line Чат» через «🔍 Найти игру».".replace("Лобби", "Lobby"))
         if s["owner"] is None and txt.startswith("/start"):
             s["owner"] = chat; save_state(s); log.info("owner registered")
             tg("sendMessage", chat_id=chat, text="Вы зарегистрированы как владелец 👑\n" + HELP); return
@@ -1477,6 +1568,8 @@ def main():
         open(out, "w").write(f"MODEL: {d['model']}\nGAME: {it['game']}\nSOURCE: {it['url']}\nMEDIA: " +
             json.dumps([{k: m[k] for k in ('type', 'url', 'path')} | {'bytes': os.path.getsize(m['path'])} for m in d['media']], ensure_ascii=False, indent=1) +
             f"\nYOUTUBE: {it['youtube']}\n\n{d['text']}\n"); print(out); return
+    tg("setMyCommands", scope={"type": "all_private_chats"}, commands=[{"command": "ask", "description": "Спросить Gemini"},
+        {"command": "new", "description": "Новый диалог с Gemini (сбросить контекст)"}, {"command": "help", "description": "Помощь"}])
     tg("setMyCommands", commands=[{"command": "draft", "description": "Сделать черновик сейчас"}, {"command": "updates", "description": "Последние обновления игр"}, {"command": "memes", "description": "Мемы на одобрение сейчас"}, {"command": "topics", "description": "Темы чата"}, {"command": "gamestats", "description": "Таблица: какие игры просят"}, {"command": "help", "description": "Помощь"}])
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=update_loop, daemon=True).start()
