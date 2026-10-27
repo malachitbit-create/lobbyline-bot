@@ -1556,17 +1556,73 @@ AK_ROLE_EMO = {"Dota 2": ["⚔️", "🔮", "🛡", "🌀", "💚"], "CS 2": ["�
                "World of Tanks": ["🦅", "⚙️", "🏰", "🎯", "☄️"], "The Finals": ["🪶", "⚖️", "🪨"],
                "Fortnite": ["🪂", "🚫", "🏅", "🎨"], "Hearthstone": ["📘", "📜", "🏟", "🎲"], "GTA 5": ["💰", "🏎", "🌆", "🎭"]}
 AK_SLOT_EMO = ["🌅", "🌞", "🌆", "🌙", "🦉"]
-AK_STEP_INFO = {"lvl": (1, "Уровень Steam", "💎"), "games": (2, "Твои игры", "🎮"), "hours": (3, "Наигранные часы", "⏳"),
+AK_STEP_INFO = {"mode": (1, "Как заполним анкету", "🪐"), "link": (2, "Профиль Steam", "🔗"), "lvl": (1, "Уровень Steam", "💎"), "games": (2, "Твои игры", "🎮"), "hours": (3, "Наигранные часы", "⏳"),
                 "roles": (4, "Роли и классы", "🎭"), "days": (5, "Дни для игры", "📅"), "slots": (6, "Время для игры", "🌙")}
 AK_NAV_BACK, AK_NAV_NEXT, AK_NAV_X = "◀ Назад", "Далее ▶", "✖ Отмена"
 def ak_pick(sel, emo, label): return ("✅ " if sel else emo + " ") + label
 def ak_progress(n, total=6): return "▰" * n + "▱" * (total - n) + f"  {n}/{total}"
 
-def render_banner(step):
+# ---- Steam mode for /anketa ----
+STEAM_KEY = os.environ.get("STEAM_API_KEY", "").strip()
+AK_STEAM_APPS = {"Dota 2": [570], "CS 2": [730], "World of Tanks": [1407200], "Overwatch": [2357570], "The Finals": [2073850],
+                 "GTA 5": [271590, 3240220]}   # Valorant, Fortnite, Hearthstone are not on Steam
+AK_SEQ = {"manual": ["mode", "lvl", "games", "hours", "roles", "days", "slots"], "steam": ["mode", "link", "roles", "days", "slots"]}
+def ak_pos(d):
+    seq = AK_SEQ.get(d.get("src") or "manual"); st = d["step"]
+    return (seq.index(st) + 1 if st in seq else 1), len(seq)
+def steam_id_from(text):
+    t = (text or "").strip()
+    m = re.search(r"steamcommunity\.com/profiles/(\d{17})", t) or re.fullmatch(r"(\d{17})", t)
+    if m: return m.group(1)
+    m = re.search(r"steamcommunity\.com/id/([A-Za-z0-9_.-]+)", t)
+    if not m: return None
+    j = requests.get("https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/", params={"key": STEAM_KEY, "vanityurl": m.group(1)}).json()
+    r = j.get("response", {})
+    return r.get("steamid") if r.get("success") == 1 else None
+def ak_fmt_hours(h):
+    return f"{h:,}".replace(",", " ") + " ч"
+def steam_fetch(sid):
+    """-> (level or None, {game: hours}, games_visible: bool)"""
+    lv = requests.get("https://api.steampowered.com/IPlayerService/GetSteamLevel/v1/", params={"key": STEAM_KEY, "steamid": sid}).json()
+    level = lv.get("response", {}).get("player_level")
+    og = requests.get("https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/",
+                      params={"key": STEAM_KEY, "steamid": sid, "include_played_free_games": 1, "include_appinfo": 0}).json().get("response", {})
+    if "games" not in og: return level, {}, False
+    mins = {g["appid"]: g.get("playtime_forever", 0) for g in og["games"]}
+    hours = {}
+    for g, ids in AK_STEAM_APPS.items():
+        m = sum(mins.get(a, 0) for a in ids)
+        if any(a in mins for a in ids) and m > 0: hours[g] = max(1, round(m / 60))
+    return level, hours, True
+def ak_steam_link(chat, uid, text):
+    """User sent a Steam link while on the 'link' step."""
+    err = None; res = None
+    try:
+        sid = steam_id_from(text)
+        if not sid: err = "🤔 Не похоже на ссылку на профиль Steam. Пришли вида\nsteamcommunity.com/profiles/7656…\nили steamcommunity.com/id/ник"
+        else:
+            level, hours, vis = steam_fetch(sid)
+            if not vis: err = ("🔒 Профиль или список игр скрыт.\nОткрой в Steam: <b>Профиль → Редактировать → Приватность → «Игры» = Открытый</b>, "
+                               "и пришли ссылку ещё раз — или заполни анкету вручную.")
+            elif not hours: err = "🕹 В профиле не нашлось наших игр со временем в игре. Можно заполнить анкету вручную."
+            else: res = (sid, level, hours)
+    except Exception as e:
+        log.warning("steam fetch: %s", type(e).__name__); err = "⚠️ Steam сейчас не отвечает. Попробуй позже или заполни вручную."
+    with lock:
+        s = load_state(); d = s.get("anketa_draft", {}).get(str(uid))
+        if not d or d.get("step") != "link": return
+        if res:
+            sid, level, hours = res
+            d.update(steamid=sid, lvl_text=str(level) if level is not None else None, games=[g for g in AK_GAMES if g in hours],
+                     hours={g: ak_fmt_hours(h) for g, h in hours.items()}, step="roles", gi=0, err=None)
+        else: d["err"] = err
+        save_state(s); d = json.loads(json.dumps(d))
+    ak_show(chat, d.get("mid"), d, new_step=bool(res))
+def render_banner(step, n=None, total=6):
     """Holographic LL banner in the avatar style for one questionnaire step."""
     from PIL import Image, ImageDraw, ImageFilter
     import io, colorsys
-    n, title, _ = AK_STEP_INFO[step]; W, H = 1280, 420
+    title = AK_STEP_INFO[step][1]; n = n or AK_STEP_INFO[step][0]; W, H = 1280, 420
     im = Image.new("RGB", (W, H), (2, 2, 10)); d = ImageDraw.Draw(im)
     rnd = random.Random(n)
     for _ in range(900):  # starfield with warp streaks toward the logo
@@ -1584,10 +1640,10 @@ def render_banner(step):
         for x in range(x0, x1):
             h = (t0 + (x - x0) / 900) % 1; r, g, b = colorsys.hsv_to_rgb(h, .32, 1)
             d.line((x, y0, x, y1), fill=(int(r * 255), int(g * 255), int(b * 255)))
-    d.text((420, 92), f"АНКЕТА LOBBY LINE · ШАГ {n} ИЗ 6", font=_font(26, 600), fill=(150, 190, 235))
+    d.text((420, 92), f"АНКЕТА LOBBY LINE · ШАГ {n} ИЗ {total}", font=_font(26, 600), fill=(150, 190, 235))
     d.text((418, 132), title, font=_font(78, 700), fill=(244, 244, 250))
-    sx, sw, gap = 420, 128, 14
-    for i in range(6):
+    sx, gap = 420, 14; sw = (850 - gap * (total - 1)) // total
+    for i in range(total):
         x0 = sx + i * (sw + gap); box = (x0, 270, x0 + sw, 292)
         if i < n:
             m = Image.new("L", (W, H)); ImageDraw.Draw(m).rounded_rectangle(box, 11, fill=255)
@@ -1599,22 +1655,34 @@ def render_banner(step):
     d.text((420, 322), "заполни за минуту — карточка соберётся сама", font=_font(24, 400), fill=(130, 134, 160))
     b = io.BytesIO(); im.save(b, "PNG"); return b.getvalue()
 AK_BANNER_IDS = {}   # step -> Telegram file_id once uploaded (in memory)
-def ak_banner_media(step, caption):
-    fid = AK_BANNER_IDS.get(step)
+def ak_banner_media(d, caption):
+    step = d["step"]; n, total = ak_pos(d); key = f"{step}:{n}:{total}"
+    fid = AK_BANNER_IDS.get(key)
     if fid: return None, {"type": "photo", "media": fid, "caption": caption, "parse_mode": "HTML"}
-    return {"p": (f"anketa_{step}.png", render_banner(step), "image/png")}, {"type": "photo", "media": "attach://p", "caption": caption, "parse_mode": "HTML"}
-def ak_remember(step, j):
+    return {"p": (f"anketa_{step}.png", render_banner(step, n, total), "image/png")}, {"type": "photo", "media": "attach://p", "caption": caption, "parse_mode": "HTML"}
+def ak_remember(d, j):
+    n, total = ak_pos(d); step = f"{d['step']}:{n}:{total}"
     try: AK_BANNER_IDS.setdefault(step, j["result"]["photo"][-1]["file_id"])
     except Exception: pass
 
 def ak_view(d):
     """(caption, keyboard) for the current step of draft d."""
     st = d["step"]; gi = d.get("gi", 0); games = d.get("games", [])
-    n, title, emo = AK_STEP_INFO[st]
-    head = f"{emo} <b>{title}</b>\n<b>{ak_progress(n)}</b>\n\n"
+    _, title, emo = AK_STEP_INFO[st]; n, total = ak_pos(d)
+    head = f"{emo} <b>{title}</b>\n<b>{ak_progress(n, total)}</b>\n\n"
+    if st == "mode":
+        t = head + ("Привет, игрок! ✨ Собираем твою карточку Lobby Line.\nКак заполним?\n\n"
+                    "🔗 <b>Через Steam</b> — уровень и часы подтянутся сами, останется выбрать роли и время.\n"
+                    "✍️ <b>Вручную</b> — всё отметишь кнопками.")
+        return t, {"inline_keyboard": [[ak_btn("🔗 Вставить ссылку на Steam", "a:m:steam")], [ak_btn("✍️ Заполнить вручную", "a:m:manual")],
+                                       [ak_btn(AK_NAV_X, "a:cancel")]]}
+    if st == "link":
+        t = head + (d.get("err") or "Пришли сообщением ссылку на свой профиль Steam 👇\n<i>steamcommunity.com/profiles/7656…</i> или <i>steamcommunity.com/id/ник</i>\n\n"
+                    "Список игр в профиле должен быть открыт (Приватность → «Игры»).")
+        return t, {"inline_keyboard": [[ak_btn(AK_NAV_BACK, "a:back"), ak_btn("✍️ Вручную", "a:m:manual")], [ak_btn(AK_NAV_X, "a:cancel")]]}
     nav = lambda nxt=True: [ak_btn(AK_NAV_BACK, "a:back")] + ([ak_btn(AK_NAV_NEXT, "a:next")] if nxt else [])
     if st == "lvl":
-        t = head + "Привет, игрок! ✨ Собираем твою карточку Lobby Line.\nДля начала: какой у тебя <b>уровень Steam</b>?"
+        t = head + "Какой у тебя <b>уровень Steam</b>? ✨"
         kb_ = ak_grid([ak_btn(ak_pick(d.get("lvl") == i, AK_LVL_EMO[i], l), f"a:lvl:{i}") for i, l in enumerate(AK_LEVELS)], 3)
     elif st == "games":
         t = head + "Во что рубишься? 🕹 Отметь <b>все игры</b>, а потом жми «Далее ▶»."
@@ -1627,6 +1695,7 @@ def ak_view(d):
         kb_.append(nav(False))
     elif st == "roles":
         g = games[gi]; cur = d.get("roles", {}).get(g, [])
+        if d.get("src") == "steam": head += f"🔗 Из Steam: {game_emoji(g)} {html.escape(g)} — {d.get('hours', {}).get(g, '')}\n"
         t = head + f"{game_emoji(g)} <b>{html.escape(g)}</b> · игра {gi + 1} из {len(games)}\nТвоя {AK_ROLE_Q[g]}? Можно отметить несколько."
         kb_ = ak_grid([ak_btn(ak_pick(r in cur, AK_ROLE_EMO[g][i], r), f"a:r:{i}") for i, r in enumerate(AK_ROLES[g])], 2)
         kb_.append([ak_btn(AK_NAV_BACK, "a:back"), ak_btn(AK_NAV_NEXT if cur else "Пропустить ▶", "a:next")])
@@ -1651,14 +1720,14 @@ def ak_show(chat, mid, d, pre="", new_step=True):
         j = tg("editMessageCaption", chat_id=chat, message_id=mid, caption=t, parse_mode="HTML", reply_markup=m)
         if j.get("ok") or "not modified" in (j.get("description") or ""): return mid
     if mid:
-        f, media = ak_banner_media(d["step"], t)
+        f, media = ak_banner_media(d, t)
         j = tg("editMessageMedia", files=f, chat_id=chat, message_id=mid, media=media, reply_markup=m)
-        if j.get("ok"): ak_remember(d["step"], j); return mid
+        if j.get("ok"): ak_remember(d, j); return mid
         if "not modified" in (j.get("description") or ""): return mid
-    f, media = ak_banner_media(d["step"], t)
+    f, media = ak_banner_media(d, t)
     kw = {"photo": media["media"]} if not f else {}
     j = tg("sendPhoto", files={"photo": f["p"]} if f else None, chat_id=chat, caption=t, parse_mode="HTML", reply_markup=m, **kw)
-    ak_remember(d["step"], j)
+    ak_remember(d, j)
     return j.get("result", {}).get("message_id")
 
 def ak_days_text(days):
@@ -1743,7 +1812,7 @@ def anketa_start(chat, fu):
         s = load_state(); old = s.get("anketas", {}).get(str(uid)) or {}
         d = {k: json.loads(json.dumps(old.get(k))) for k in ("lvl", "games", "hours", "roles", "days", "slots") if old.get(k) is not None}
         d["lvl"] = AK_LEVELS.index(d["lvl"]) if d.get("lvl") in AK_LEVELS else None
-        d.update(step="lvl", gi=0, mid=None); s.setdefault("anketa_draft", {})[str(uid)] = d; save_state(s)
+        d.update(step="mode", gi=0, mid=None, src=None, err=None); s.setdefault("anketa_draft", {})[str(uid)] = d; save_state(s)
     pre = "✏️ <i>Анкета уже есть — проходим заново, прежние ответы отмечены ✅</i>\n\n" if old else ""
     mid = ak_show(chat, None, d, pre)
     with lock:
@@ -1766,7 +1835,8 @@ def anketa_publish(s, uid, a, png):
 
 def anketa_finish(q, d):
     fu = q["from"]; uid = fu["id"]; chat = q["message"]["chat"]["id"]
-    a = {"uid": uid, "nick": ak_nick(fu), "username": fu.get("username"), "lvl": AK_LEVELS[d["lvl"]] if d.get("lvl") is not None else None,
+    a = {"uid": uid, "nick": ak_nick(fu), "username": fu.get("username"), "lvl": d.get("lvl_text") if d.get("src") == "steam" else (AK_LEVELS[d["lvl"]] if d.get("lvl") is not None else None),
+         "src": d.get("src") or "manual", "steamid": d.get("steamid"),
          "games": d.get("games", []), "hours": {g: d.get("hours", {}).get(g) for g in d.get("games", []) if d.get("hours", {}).get(g)},
          "roles": {g: d.get("roles", {}).get(g, []) for g in d.get("games", [])}, "days": d.get("days", []), "slots": d.get("slots", []),
          "updated": int(time.time())}
@@ -1807,7 +1877,16 @@ def on_anketa_btn(q):
             s["anketa_draft"].pop(str(uid)); save_state(s)
             tg("answerCallbackQuery", callback_query_id=q["id"], text="Отменено")
             return tg("editMessageCaption", chat_id=chat, message_id=d["mid"], caption="✖ Анкета отменена. Вернуться можно в любой момент: /anketa", reply_markup={"inline_keyboard": []})
-        if act == "lvl": d["lvl"] = int(arg); d["step"] = "games"
+        if act == "m":
+            if arg == "steam" and not STEAM_KEY:
+                save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], show_alert=True,
+                    text="🔗 Режим через Steam временно недоступен. Заполни анкету вручную — это пара минут ✍️")
+            d["src"] = arg; d["err"] = None; d["gi"] = 0
+            if arg == "manual":
+                d["step"] = "lvl"; d.pop("lvl_text", None)
+                if d.get("steamid"): d.update(games=[], hours={}, steamid=None)
+            else: d["step"] = "link"
+        elif act == "lvl": d["lvl"] = int(arg); d["step"] = "games"
         elif act == "g": tog(games, AK_GAMES[int(arg)]); games.sort(key=AK_GAMES.index)
         elif act == "h":
             d.setdefault("hours", {})[games[d["gi"]]] = AK_HOURS[int(arg)]
@@ -1834,6 +1913,8 @@ def on_anketa_btn(q):
         elif act == "back":
             st = d["step"]
             if st in ("hours", "roles") and d["gi"] > 0: d["gi"] -= 1
+            elif st in ("lvl", "link"): d["step"] = "mode"
+            elif st == "roles" and d.get("src") == "steam": d["step"] = "link"
             elif st == "games": d["step"] = "lvl"
             elif st == "hours": d["step"] = "games"
             elif st == "roles": d["step"] = "hours"; d["gi"] = len(games) - 1
@@ -1928,6 +2009,8 @@ def on_update(u):
                     tg("deleteMessage", chat_id=msg["chat"]["id"], message_id=msg["message_id"])
             return
         dcmd = txt.split(" ")[0].split("@")[0] if txt.startswith("/") else ""
+        if txt and not dcmd and (s.get("anketa_draft", {}).get(str(chat)) or {}).get("step") == "link":
+            return POOL.submit(_safe, "steamlink", ak_steam_link, chat, chat, txt)
         if dcmd in ("/anketa", "/profile") or txt.strip() == "/start anketa":
             if not ak_is_member(s, chat): return tg("sendMessage", chat_id=chat, text="Анкета доступна участникам чата «Lobby Line Чат» 🙂")
             if dcmd == "/profile": return POOL.submit(_safe, "profile", profile_cmd, msg, s)
