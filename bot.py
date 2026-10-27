@@ -1549,40 +1549,117 @@ def ak_is_member(s, uid):
     st = (j.get("result") or {}).get("status")
     return st in ("creator", "administrator", "member") or (st == "restricted" and j["result"].get("is_member"))
 
+AK_LVL_EMO = ["🌱", "⭐", "🌟", "💫", "💎", "👑", "🚫"]
+AK_HRS_EMO = ["⏳", "🕐", "🔥", "⚡", "🏆"]
+AK_ROLE_EMO = {"Dota 2": ["⚔️", "🔮", "🛡", "🌀", "💚"], "CS 2": ["💥", "🎯", "🐍", "🧰", "🧠"],
+               "Overwatch": ["🛡", "💥", "💚"], "Valorant": ["⚔️", "🔍", "🌫", "🧱"],
+               "World of Tanks": ["🦅", "⚙️", "🏰", "🎯", "☄️"], "The Finals": ["🪶", "⚖️", "🪨"],
+               "Fortnite": ["🪂", "🚫", "🏅", "🎨"], "Hearthstone": ["📘", "📜", "🏟", "🎲"], "GTA 5": ["💰", "🏎", "🌆", "🎭"]}
+AK_SLOT_EMO = ["🌅", "🌞", "🌆", "🌙", "🦉"]
+AK_STEP_INFO = {"lvl": (1, "Уровень Steam", "💎"), "games": (2, "Твои игры", "🎮"), "hours": (3, "Наигранные часы", "⏳"),
+                "roles": (4, "Роли и классы", "🎭"), "days": (5, "Дни для игры", "📅"), "slots": (6, "Время для игры", "🌙")}
+AK_NAV_BACK, AK_NAV_NEXT, AK_NAV_X = "◀ Назад", "Далее ▶", "✖ Отмена"
+def ak_pick(sel, emo, label): return ("✅ " if sel else emo + " ") + label
+def ak_progress(n, total=6): return "▰" * n + "▱" * (total - n) + f"  {n}/{total}"
+
+def render_banner(step):
+    """Holographic LL banner in the avatar style for one questionnaire step."""
+    from PIL import Image, ImageDraw, ImageFilter
+    import io, colorsys
+    n, title, _ = AK_STEP_INFO[step]; W, H = 1280, 420
+    im = Image.new("RGB", (W, H), (2, 2, 10)); d = ImageDraw.Draw(im)
+    rnd = random.Random(n)
+    for _ in range(900):  # starfield with warp streaks toward the logo
+        x, y = rnd.uniform(0, W), rnd.uniform(0, H); v = rnd.randint(40, 200)
+        if rnd.random() < .08:
+            dx, dy = x - 210, y - H / 2; k = rnd.uniform(.04, .12); d.line((x, y, x + dx * k, y + dy * k), fill=(v // 2, v // 2, v // 2 + 30), width=1)
+        else: r = .6 if v < 150 else 1.1; d.ellipse((x - r, y - r, x + r, y + r), fill=(v, v, min(255, v + 25)))
+    glow = Image.new("RGB", (W, H)); gd = ImageDraw.Draw(glow)
+    gd.ellipse((60, 60, 360, 360), fill=(70, 80, 140)); im = Image.blend(im, Image.composite(glow, im, glow.convert("L")).filter(ImageFilter.GaussianBlur(70)), .55)
+    try:
+        lg = Image.open(LOGO).convert("RGBA"); lg.thumbnail((290, 290)); im.paste(lg, (210 - lg.size[0] // 2, H // 2 - lg.size[1] // 2), lg)
+    except Exception: pass
+    d = ImageDraw.Draw(im)
+    def holo(x0, x1, y0, y1, t0=0.0):
+        for x in range(x0, x1):
+            h = (t0 + (x - x0) / 900) % 1; r, g, b = colorsys.hsv_to_rgb(h, .32, 1)
+            d.line((x, y0, x, y1), fill=(int(r * 255), int(g * 255), int(b * 255)))
+    d.text((420, 92), f"АНКЕТА LOBBY LINE · ШАГ {n} ИЗ 6", font=_font(26, 600), fill=(150, 190, 235))
+    d.text((418, 132), title, font=_font(78, 700), fill=(244, 244, 250))
+    sx, sw, gap = 420, 128, 14
+    for i in range(6):
+        x0 = sx + i * (sw + gap); box = (x0, 270, x0 + sw, 292)
+        if i < n:
+            m = Image.new("L", (W, H)); ImageDraw.Draw(m).rounded_rectangle(box, 11, fill=255)
+            hl = Image.new("RGB", (W, H)); hd = ImageDraw.Draw(hl)
+            for x in range(x0, x0 + sw):
+                r, g, b = colorsys.hsv_to_rgb(((x - sx) / 850 + .55) % 1, .35, 1); hd.line((x, 270, x, 292), fill=(int(r * 255), int(g * 255), int(b * 255)))
+            im.paste(hl, (0, 0), m); d = ImageDraw.Draw(im)
+        else: d.rounded_rectangle(box, 11, outline=(70, 78, 110), width=2, fill=(14, 16, 30))
+    d.text((420, 322), "заполни за минуту — карточка соберётся сама", font=_font(24, 400), fill=(130, 134, 160))
+    b = io.BytesIO(); im.save(b, "PNG"); return b.getvalue()
+AK_BANNER_IDS = {}   # step -> Telegram file_id once uploaded (in memory)
+def ak_banner_media(step, caption):
+    fid = AK_BANNER_IDS.get(step)
+    if fid: return None, {"type": "photo", "media": fid, "caption": caption, "parse_mode": "HTML"}
+    return {"p": (f"anketa_{step}.png", render_banner(step), "image/png")}, {"type": "photo", "media": "attach://p", "caption": caption, "parse_mode": "HTML"}
+def ak_remember(step, j):
+    try: AK_BANNER_IDS.setdefault(step, j["result"]["photo"][-1]["file_id"])
+    except Exception: pass
+
 def ak_view(d):
-    """(text, keyboard) for the current step of draft d."""
+    """(caption, keyboard) for the current step of draft d."""
     st = d["step"]; gi = d.get("gi", 0); games = d.get("games", [])
-    head = "📝 <b>Анкета участника Lobby Line</b>\n"
+    n, title, emo = AK_STEP_INFO[st]
+    head = f"{emo} <b>{title}</b>\n<b>{ak_progress(n)}</b>\n\n"
+    nav = lambda nxt=True: [ak_btn(AK_NAV_BACK, "a:back")] + ([ak_btn(AK_NAV_NEXT, "a:next")] if nxt else [])
     if st == "lvl":
-        t = head + "Шаг 1/6. Какой у тебя уровень Steam?"
-        kb_ = ak_grid([ak_btn(("✅ " if d.get("lvl") == i else "") + l, f"a:lvl:{i}") for i, l in enumerate(AK_LEVELS)], 3)
+        t = head + "Привет, игрок! ✨ Собираем твою карточку Lobby Line.\nДля начала: какой у тебя <b>уровень Steam</b>?"
+        kb_ = ak_grid([ak_btn(ak_pick(d.get("lvl") == i, AK_LVL_EMO[i], l), f"a:lvl:{i}") for i, l in enumerate(AK_LEVELS)], 3)
     elif st == "games":
-        t = head + "Шаг 2/6. В какие игры играешь? Можно выбрать несколько, потом «Далее»."
-        kb_ = ak_grid([ak_btn(("✅ " if g in games else "") + ak_short(g), f"a:g:{i}") for i, g in enumerate(AK_GAMES)], 3)
-        kb_.append([ak_btn("⬅️ Назад", "a:back"), ak_btn("Далее ➡️", "a:next")])
+        t = head + "Во что рубишься? 🕹 Отметь <b>все игры</b>, а потом жми «Далее ▶»."
+        kb_ = ak_grid([ak_btn(ak_pick(g in games, game_emoji(g), ak_short(g)), f"a:g:{i}") for i, g in enumerate(AK_GAMES)], 3)
+        kb_.append(nav())
     elif st == "hours":
         g = games[gi]; cur = d.get("hours", {}).get(g)
-        t = head + f"Шаг 3/6. Сколько часов в <b>{html.escape(g)}</b>? ({gi + 1}/{len(games)})"
-        kb_ = ak_grid([ak_btn(("✅ " if cur == h else "") + h, f"a:h:{i}") for i, h in enumerate(AK_HOURS)], 3)
-        kb_.append([ak_btn("⬅️ Назад", "a:back")])
+        t = head + f"{game_emoji(g)} <b>{html.escape(g)}</b> · игра {gi + 1} из {len(games)}\nСколько часов наиграно? Честно-честно 😉"
+        kb_ = ak_grid([ak_btn(ak_pick(cur == h, AK_HRS_EMO[i], h), f"a:h:{i}") for i, h in enumerate(AK_HOURS)], 2)
+        kb_.append(nav(False))
     elif st == "roles":
         g = games[gi]; cur = d.get("roles", {}).get(g, [])
-        t = head + f"Шаг 4/6. <b>{html.escape(g)}</b>: {AK_ROLE_Q[g]}? Можно несколько. ({gi + 1}/{len(games)})"
-        kb_ = ak_grid([ak_btn(("✅ " if r in cur else "") + r, f"a:r:{i}") for i, r in enumerate(AK_ROLES[g])], 3 if len(AK_ROLES[g]) != 4 else 2)
-        kb_.append([ak_btn("⬅️ Назад", "a:back"), ak_btn("Далее ➡️" if cur else "Пропустить ➡️", "a:next")])
+        t = head + f"{game_emoji(g)} <b>{html.escape(g)}</b> · игра {gi + 1} из {len(games)}\nТвоя {AK_ROLE_Q[g]}? Можно отметить несколько."
+        kb_ = ak_grid([ak_btn(ak_pick(r in cur, AK_ROLE_EMO[g][i], r), f"a:r:{i}") for i, r in enumerate(AK_ROLES[g])], 2)
+        kb_.append([ak_btn(AK_NAV_BACK, "a:back"), ak_btn(AK_NAV_NEXT if cur else "Пропустить ▶", "a:next")])
     elif st == "days":
         cur = d.get("days", [])
-        t = head + "Шаг 5/6. В какие дни удобно играть?"
-        kb_ = [[ak_btn(("✅" if x in cur else "") + x, f"a:d:{i}") for i, x in enumerate(AK_DAYS)],
-               [ak_btn("Будни", "a:d:wk"), ak_btn("Выходные", "a:d:we"), ak_btn("Каждый день", "a:d:all")],
-               [ak_btn("⬅️ Назад", "a:back"), ak_btn("Далее ➡️", "a:next")]]
+        t = head + "Когда тебя ждать в лобби? 📆 Отметь дни."
+        kb_ = ak_grid([ak_btn(("✅ " if x in cur else "▫️ ") + x, f"a:d:{i}") for i, x in enumerate(AK_DAYS)], 4)
+        kb_.append([ak_btn("💼 Будни", "a:d:wk"), ak_btn("🎉 Выходные", "a:d:we"), ak_btn("🔁 Каждый день", "a:d:all")])
+        kb_.append(nav())
     else:
         cur = d.get("slots", [])
-        t = head + "Шаг 6/6. В какое время удобно играть? (время московское)"
-        kb_ = ak_grid([ak_btn(("✅ " if x in cur else "") + x, f"a:s:{i}") for i, x in enumerate(AK_SLOTS)], 2)
-        kb_.append([ak_btn("⬅️ Назад", "a:back"), ak_btn("✅ Готово", "a:done")])
-    kb_.append([ak_btn("✖️ Отмена", "a:cancel")])
+        t = head + "И последнее: в какое <b>время</b> удобно? 🕰 (по Москве)"
+        kb_ = ak_grid([ak_btn(ak_pick(x in cur, AK_SLOT_EMO[i], x), f"a:s:{i}") for i, x in enumerate(AK_SLOTS)], 2)
+        kb_.append([ak_btn(AK_NAV_BACK, "a:back"), ak_btn("✨ Готово — собрать карточку", "a:done")])
+    kb_.append([ak_btn(AK_NAV_X, "a:cancel")])
     return t, {"inline_keyboard": kb_}
+
+def ak_show(chat, mid, d, pre="", new_step=True):
+    """Show step d as banner photo + caption; edits mid in place when possible. Returns message_id."""
+    t, m = ak_view(d); t = pre + t
+    if mid and not new_step:
+        j = tg("editMessageCaption", chat_id=chat, message_id=mid, caption=t, parse_mode="HTML", reply_markup=m)
+        if j.get("ok") or "not modified" in (j.get("description") or ""): return mid
+    if mid:
+        f, media = ak_banner_media(d["step"], t)
+        j = tg("editMessageMedia", files=f, chat_id=chat, message_id=mid, media=media, reply_markup=m)
+        if j.get("ok"): ak_remember(d["step"], j); return mid
+        if "not modified" in (j.get("description") or ""): return mid
+    f, media = ak_banner_media(d["step"], t)
+    kw = {"photo": media["media"]} if not f else {}
+    j = tg("sendPhoto", files={"photo": f["p"]} if f else None, chat_id=chat, caption=t, parse_mode="HTML", reply_markup=m, **kw)
+    ak_remember(d["step"], j)
+    return j.get("result", {}).get("message_id")
 
 def ak_days_text(days):
     idx = sorted(AK_DAYS.index(x) for x in days if x in AK_DAYS)
@@ -1667,8 +1744,8 @@ def anketa_start(chat, fu):
         d = {k: json.loads(json.dumps(old.get(k))) for k in ("lvl", "games", "hours", "roles", "days", "slots") if old.get(k) is not None}
         d["lvl"] = AK_LEVELS.index(d["lvl"]) if d.get("lvl") in AK_LEVELS else None
         d.update(step="lvl", gi=0, mid=None); s.setdefault("anketa_draft", {})[str(uid)] = d; save_state(s)
-    pre = "✏️ У тебя уже есть анкета — пройди шаги ещё раз, отмеченное сохранено.\n\n" if old else ""
-    t, m = ak_view(d); mid = ak_edit_or_send(chat, None, pre + t, m)
+    pre = "✏️ <i>Анкета уже есть — проходим заново, прежние ответы отмечены ✅</i>\n\n" if old else ""
+    mid = ak_show(chat, None, d, pre)
     with lock:
         s = load_state(); dd = s.get("anketa_draft", {}).get(str(uid))
         if dd: dd["mid"] = mid; save_state(s)
@@ -1724,12 +1801,12 @@ def on_anketa_btn(q):
         s = load_state(); d = s.get("anketa_draft", {}).get(str(uid))
         if not d:
             save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], text="Анкета устарела, начни заново: /anketa", show_alert=True)
-        d["mid"] = q["message"]["message_id"]; act, _, arg = data.partition(":"); note = None; games = d.setdefault("games", [])
+        d["mid"] = q["message"]["message_id"]; prev = (d["step"], d.get("gi", 0)); act, _, arg = data.partition(":"); note = None; games = d.setdefault("games", [])
         def tog(lst, v): lst.remove(v) if v in lst else lst.append(v)
         if act == "cancel":
             s["anketa_draft"].pop(str(uid)); save_state(s)
             tg("answerCallbackQuery", callback_query_id=q["id"], text="Отменено")
-            return tg("editMessageText", chat_id=chat, message_id=d["mid"], text="Анкета отменена. Начать заново: /anketa")
+            return tg("editMessageCaption", chat_id=chat, message_id=d["mid"], caption="✖ Анкета отменена. Вернуться можно в любой момент: /anketa", reply_markup={"inline_keyboard": []})
         if act == "lvl": d["lvl"] = int(arg); d["step"] = "games"
         elif act == "g": tog(games, AK_GAMES[int(arg)]); games.sort(key=AK_GAMES.index)
         elif act == "h":
@@ -1769,7 +1846,7 @@ def on_anketa_btn(q):
     if d["step"] == "finish":
         tg("answerCallbackQuery", callback_query_id=q["id"], text="Рисую карточку… 🎨"); return anketa_finish(q, d)
     tg("answerCallbackQuery", callback_query_id=q["id"], text=note or "", show_alert=False)
-    t, m = ak_view(d); tg("editMessageText", chat_id=chat, message_id=d["mid"], text=t, parse_mode="HTML", reply_markup=m)
+    ak_show(chat, d["mid"], d, new_step=d["step"] != prev[0])
 
 def ak_find_target(s, msg):
     rm = msg.get("reply_to_message") or {}
