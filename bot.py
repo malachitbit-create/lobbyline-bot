@@ -1487,6 +1487,10 @@ def main():
     g0 = load_state().get("group")
     if g0: tg("setMyCommands", commands=GROUP_CMDS, scope={"type": "chat", "chat_id": g0})
     threading.Thread(target=watchdog, daemon=True).start()
+    def _gemini_selftest():
+        try: t, m = gemini_lite("Ответь одним словом: работает?"); log.info("gemini self-test ok: %s -> %s", m, t[:40])
+        except Exception as e: log.warning("gemini self-test failed: %s", e)
+    threading.Thread(target=_gemini_selftest, daemon=True).start()
     log.info("bot started"); offset = None
     PST = {"n": 0, "max": 0.0, "sum": 0.0, "t": time.time()}
     AU = json.dumps(["message", "callback_query", "my_chat_member", "inline_query", "chosen_inline_result"])
