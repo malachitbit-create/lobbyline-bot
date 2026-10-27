@@ -527,6 +527,12 @@ def handle_group(msg, s):
         g = norm_game(ftc["name"])
         if g: s.setdefault("topics", {})[g] = th; changed = True; log.info("topic %s -> %s", g, th)
     rt = msg.get("reply_to_message", {}).get("forum_topic_created")
+    if rt and th and rt.get("name") and chat["id"] == s.get("group") and msg.get("is_topic_message"):
+        et = existing_topics(s); nm = rt["name"].strip()
+        k = next((k for k in et if _tk(k) == _tk(nm)), nm); e = et.setdefault(k, {"th": None, "aliases": []})
+        if e.get("th") != th or (rt.get("icon_custom_emoji_id") and not e.get("icon")):
+            e["th"] = th; e["icon"] = e.get("icon") or rt.get("icon_custom_emoji_id"); changed = True; s["stats_dirty"] = True
+            log.info("topic learned from message: %s -> %s", k, th)
     if rt and th:
         g = norm_game(rt.get("name"))
         if g and topic_of(s, g) != th: s.setdefault("topics", {})[g] = th; changed = True; log.info("topic(reply) %s -> %s", g, th)
@@ -553,7 +559,10 @@ def handle_group(msg, s):
             tg("sendMessage", chat_id=owner, text=topics_text(s))
         if cmd in ("/bindgroup", "/settopic", "/topics", "/votepost"):
             tg("deleteMessage", chat_id=chat["id"], message_id=msg["message_id"])
-    if changed: flush_queue(s); save_state(s)
+    if changed:
+        rf = refund_topic_votes(s)
+        if rf: log.info("refunded votes after topic update: %s", rf)
+        flush_queue(s); save_state(s)
 
 def topics_cmd(chat, txt):
     parts = txt.split(maxsplit=2); act = parts[1].lower() if len(parts) > 1 else ""; arg = parts[2].strip() if len(parts) > 2 else ""
@@ -879,7 +888,8 @@ BASE_ALIASES = {"dota 2", "dota2", "cs 2", "cs2", "counter-strike 2", "fortnite"
                 "overwatch", "overwatch 2", "the finals", "gta 5", "gta v", "grand theft auto v", "grand theft auto v enhanced", "grand theft auto v legacy"}
 def _nt(t): return re.sub(r"[^\w]+", " ", (t or "").lower()).strip()
 def _tk(t): return re.sub(r"[\W_]+", "", (t or "").lower())
-EXISTING_SEED = {"Dota 2": ["dota", "дота", "дота 2"], "Valorant": ["валорант"], "Fortnite": ["фортнайт"]}
+EXISTING_SEED = {"Dota 2": ["dota", "дота", "дота 2"], "Valorant": ["валорант"], "Fortnite": ["фортнайт"],
+                 "The Finals": ["finals", "the finals", "зе финалс", "файналс"]}
 def existing_topics(s):
     """{name: {"th": thread_id|None, "aliases": [...]}} — games that already have a topic and don't take part in voting."""
     et = s.setdefault("existing_topics", {})
@@ -899,6 +909,18 @@ def has_topic(s, title, appid=None): return topic_entry(s, title) is not None
 def topic_link(s, th):
     g = s.get("group")
     return f"https://t.me/c/{str(g)[4:] if str(g).startswith('-100') else str(g).lstrip('-')}/{th}" if g and th else None
+def topic_button(s, title):
+    """Inline URL button straight into the topic, or None if its thread id is unknown."""
+    te = topic_entry(s, title)
+    if not te: return None
+    k, e = te; ln = topic_link(s, e.get("th"))
+    return {"inline_keyboard": [[{"text": f"🎮 {k} → перейти", "url": ln}]]} if ln else None
+def topic_jump_msg(chat, title):
+    """Short notice with a jump button; removed after 60 s (vote not counted, wallet untouched)."""
+    s = load_state(); te = topic_entry(s, title); k = te[0] if te else title; kb = topic_button(s, title)
+    j = tg("sendMessage", chat_id=chat, text=f"У игры «{k}» уже есть своя тема в чате — голос не засчитан и не списан, можно проголосовать за другую игру.",
+           disable_notification=True, **({"reply_markup": kb} if kb else {}))
+    if j.get("ok"): del_later(chat, j["result"]["message_id"], 60)
 def topic_notice(s, title):
     """HTML notice with the topic icon (custom emoji if known) and a direct link."""
     k, e = topic_entry(s, title); ln = topic_link(s, e.get("th")); ic = e.get("icon")
@@ -941,6 +963,7 @@ def on_inline(q):
             if has_topic(s, g["title"]):
                 r = {"type": "article", "id": "t" + hashlib.md5(_tk(g["title"]).encode()).hexdigest()[:12], "title": g["title"],
                      "description": "✅ уже есть тема", "input_message_content": {"message_text": topic_notice(s, g["title"]), "parse_mode": "HTML", "disable_web_page_preview": True}}
+                if topic_button(s, g["title"]): r["reply_markup"] = topic_button(s, g["title"])
                 if g.get("img"): r["thumbnail_url"] = g["img"]
                 res.append(r); continue
             # Epic duplicates of a Steam game share one vote bucket
@@ -1021,6 +1044,20 @@ def myvote_text(s, uid):
     if w["avail"] > 0 and not w.get("next"): return f"Голос доступен ✅\nДоступно голосов: {w['avail']} (максимум {VOTE_CAP})"
     t = f"Доступно голосов: {w['avail']}. Следующий через {next_str(w)}"
     return ("Голос доступен ✅\n" + t) if w["avail"] > 0 else t
+def refund_topic_votes(s):
+    """Votes for games that already have a topic don't count: remove them and give the votes back."""
+    out = []
+    for gid, g in s.get("votes", {}).items():
+        if not g.get("users") or g.get("status") == "created" or not has_topic(s, g["title"]): continue
+        for u in g["users"]:
+            w = wallet(s, u); w["avail"] = min(VOTE_CAP, w["avail"] + 1)
+            h = w.get("hist", [])
+            i = next((i for i in range(len(h) - 1, -1, -1) if h[i].get("g") == gid), None)
+            if i is not None: h.pop(i)
+            if w["avail"] >= VOTE_CAP: w["next"] = None
+        out.append(f"{g['title']}: {len(g['users'])}"); g["users"] = []; g["status"] = "topic"
+    if out: s["stats_dirty"] = True; s["stats_at"] = 0
+    return out
 def migrate_wallets(s):
     if s.get("wallets_migrated"): return
     now = time.time()
@@ -1036,7 +1073,10 @@ def on_vote(q, s, gid):
     if not g: return tg("answerCallbackQuery", callback_query_id=q["id"], text="Игра не найдена, найдите её заново через поиск", show_alert=True)
     if g["status"] == "created" or has_topic(s, g["title"]):
         threading.Thread(target=bump_tag, args=(f"{uid}:{_nt(g['title'])}", 0), daemon=True).start()
-        return tg("answerCallbackQuery", callback_query_id=q["id"], text="Эта игра уже есть в чатах", show_alert=True)
+        tg("answerCallbackQuery", callback_query_id=q["id"], text="Эта игра уже есть в чатах — голос не списан, можно выбрать другую 👇")
+        chat = (q.get("message") or {}).get("chat", {}).get("id") or s.get("group")
+        threading.Thread(target=topic_jump_msg, args=(chat, g["title"]), daemon=True).start()
+        return
     threading.Thread(target=bump_tag, args=(f"{uid}:{_nt(g['title'])}", 0), daemon=True).start()
     w = wallet(s, uid)
     if w["avail"] <= 0:
@@ -1577,7 +1617,10 @@ def main():
     threading.Thread(target=votepost_loop, daemon=True).start()
     threading.Thread(target=tracker_loop, daemon=True).start()
     threading.Thread(target=autodel_loop, daemon=True).start()
-    with lock: s0 = load_state(); migrate_wallets(s0); save_state(s0)
+    with lock:
+        s0 = load_state(); migrate_wallets(s0); existing_topics(s0); rf = refund_topic_votes(s0); save_state(s0)
+    log.info("topic-vote audit: refunded %s; topics without thread id: %s", rf or "nothing",
+             [k for k, e in s0.get("existing_topics", {}).items() if not e.get("th")])
     BOT_ID[0] = tg("getMe").get("result", {}).get("id")
     g0 = load_state().get("group")
     if g0: tg("setMyCommands", commands=GROUP_CMDS, scope={"type": "chat", "chat_id": g0})
