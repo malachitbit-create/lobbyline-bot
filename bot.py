@@ -1133,7 +1133,7 @@ def on_vote_owner(q, s, act, gid):
     tg("sendMessage", chat_id=chat, text=f"✅ Тема «{g['title']}» создана ({th}) и добавлена в список тем")
 
 # ---------- handlers ----------
-HELP = ("Я готовлю черновики постов для @lobbyline.\n/draft — сделать черновик сейчас\n/updates — последние официальные обновления игр\n/memes — мемы на одобрение\n/topics — темы чата\n/votepost — (в General) обновить закреплённую таблицу\n/gamestats — таблица «Какие игры просят» в личку\nЛюбой текст или /ask — вопрос к Gemini, /new — новый диалог\n/allow id|@ник — открыть доступ к боту в личке\n/deny id — закрыть доступ\n/allowed — список допущенных\n/help — помощь\n"
+HELP = ("Я готовлю черновики постов для @lobbyline.\n/draft — сделать черновик сейчас\n/updates — последние официальные обновления игр\n/memes — мемы на одобрение\n/topics — темы чата\n/votepost — (в General) обновить закреплённую таблицу\n/gamestats — таблица «Какие игры просят» в личку\n/anketa — анкета участника, /profile @ник — чужая анкета\nЛюбой текст или /ask — вопрос к Gemini, /new — новый диалог\n/allow id|@ник — открыть доступ к боту в личке\n/deny id — закрыть доступ\n/allowed — список допущенных\n/help — помощь\n"
         "Автоматически: 10:00, 15:00, 20:00 (Екб); патчноуты проверяются каждые 30 мин. Ничего не публикуется без кнопки ✅.")
 # ---------- game mention tracker (General topic memory) ----------
 BOT_ID = [None]
@@ -1323,7 +1323,8 @@ def greply(chat, **kw):
     return j
 GROUP_CMDS = [{"command": "vote", "description": "Найти игру и проголосовать"}, {"command": "top", "description": "Топ игр по голосам"},
               {"command": "voters", "description": "Кто за что голосовал"}, {"command": "stats", "description": "Таблица «Какие игры просят»"},
-              {"command": "myvote", "description": "Сколько у меня голосов и когда следующий"}]
+              {"command": "myvote", "description": "Сколько у меня голосов и когда следующий"},
+              {"command": "anketa", "description": "Заполнить анкету (в личке бота)"}, {"command": "profile", "description": "Анкета участника: /profile @ник или ответом"}]
 def group_cmd(msg, s, cmd):
     chat = msg["chat"]["id"]
     if cmd == "/vote": greply(chat, text="🔍 Нажмите кнопку и начните вводить название игры:", reply_markup={"inline_keyboard": [[{"text": "🔍 Найти игру", "switch_inline_query_current_chat": ""}]]})
@@ -1512,6 +1513,312 @@ def _chat_route(chat, txt):
     else: q = txt.strip()
     POOL.submit(_safe, "chat", _chat_reply, chat, q); return True
 
+# ---- member questionnaire (/anketa, /profile) ----
+ANKETA_PUBLISH = os.environ.get("ANKETA_PUBLISH", "off").lower() in ("1", "on", "true", "yes")
+ANKETA_TOPIC_NAME = "Анкеты"
+AK_GAMES = ["Dota 2", "CS 2", "Fortnite", "Valorant", "World of Tanks", "Hearthstone", "Overwatch", "The Finals", "GTA 5"]
+AK_SHORT = {"World of Tanks": "WoT"}
+AK_LEVELS = ["0–10", "11–25", "26–50", "51–100", "101–200", "200+", "Нет Steam"]
+AK_HOURS = ["до 100 ч", "100–500 ч", "500–1000 ч", "1000–3000 ч", "3000+ ч"]
+AK_ROLES = {"Dota 2": ["1 (керри)", "2 (мид)", "3 (оффлейн)", "4 (роумер)", "5 (саппорт)"],
+            "CS 2": ["Entry", "AWP", "Lurker", "Support", "IGL"],
+            "Overwatch": ["Танк", "Урон", "Поддержка"],
+            "Valorant": ["Дуэлянт", "Инициатор", "Контроллер", "Страж"],
+            "World of Tanks": ["ЛТ", "СТ", "ТТ", "ПТ", "САУ"],
+            "The Finals": ["Light", "Medium", "Heavy"],
+            "Fortnite": ["Королевская битва", "Без строительства", "Ранговый", "Творческий"],
+            "Hearthstone": ["Стандарт", "Вольный", "Поля сражений", "Арена"],
+            "GTA 5": ["Ограбления", "Гонки", "Свободная игра", "RP-серверы"]}
+AK_ROLE_Q = {"Dota 2": "позиция", "CS 2": "роль", "Overwatch": "роль", "Valorant": "роль", "World of Tanks": "класс техники",
+             "The Finals": "класс", "Fortnite": "режим", "Hearthstone": "режим", "GTA 5": "чем занимаешься"}
+AK_DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+AK_SLOTS = ["Утро 08–12", "День 12–17", "Вечер 17–21", "Ночь 21–01", "Поздно 01–05"]
+AK_STEPS = ["lvl", "games", "hours", "roles", "days", "slots"]
+
+def ak_short(g): return AK_SHORT.get(g, g)
+def ak_nick(fu):
+    n = " ".join(x for x in (fu.get("first_name"), fu.get("last_name")) if x) or fu.get("username") or str(fu.get("id"))
+    return n[:40]
+def ak_btn(text, data): return {"text": text, "callback_data": data}
+def ak_grid(btns, n): return [btns[i:i + n] for i in range(0, len(btns), n)]
+def ak_is_member(s, uid):
+    if is_allowed(s, uid): return True
+    g = s.get("group")
+    if not g: return False
+    j = tg("getChatMember", chat_id=g, user_id=uid)
+    st = (j.get("result") or {}).get("status")
+    return st in ("creator", "administrator", "member") or (st == "restricted" and j["result"].get("is_member"))
+
+def ak_view(d):
+    """(text, keyboard) for the current step of draft d."""
+    st = d["step"]; gi = d.get("gi", 0); games = d.get("games", [])
+    head = "📝 <b>Анкета участника Lobby Line</b>\n"
+    if st == "lvl":
+        t = head + "Шаг 1/6. Какой у тебя уровень Steam?"
+        kb_ = ak_grid([ak_btn(("✅ " if d.get("lvl") == i else "") + l, f"a:lvl:{i}") for i, l in enumerate(AK_LEVELS)], 3)
+    elif st == "games":
+        t = head + "Шаг 2/6. В какие игры играешь? Можно выбрать несколько, потом «Далее»."
+        kb_ = ak_grid([ak_btn(("✅ " if g in games else "") + ak_short(g), f"a:g:{i}") for i, g in enumerate(AK_GAMES)], 3)
+        kb_.append([ak_btn("⬅️ Назад", "a:back"), ak_btn("Далее ➡️", "a:next")])
+    elif st == "hours":
+        g = games[gi]; cur = d.get("hours", {}).get(g)
+        t = head + f"Шаг 3/6. Сколько часов в <b>{html.escape(g)}</b>? ({gi + 1}/{len(games)})"
+        kb_ = ak_grid([ak_btn(("✅ " if cur == h else "") + h, f"a:h:{i}") for i, h in enumerate(AK_HOURS)], 3)
+        kb_.append([ak_btn("⬅️ Назад", "a:back")])
+    elif st == "roles":
+        g = games[gi]; cur = d.get("roles", {}).get(g, [])
+        t = head + f"Шаг 4/6. <b>{html.escape(g)}</b>: {AK_ROLE_Q[g]}? Можно несколько. ({gi + 1}/{len(games)})"
+        kb_ = ak_grid([ak_btn(("✅ " if r in cur else "") + r, f"a:r:{i}") for i, r in enumerate(AK_ROLES[g])], 3 if len(AK_ROLES[g]) != 4 else 2)
+        kb_.append([ak_btn("⬅️ Назад", "a:back"), ak_btn("Далее ➡️" if cur else "Пропустить ➡️", "a:next")])
+    elif st == "days":
+        cur = d.get("days", [])
+        t = head + "Шаг 5/6. В какие дни удобно играть?"
+        kb_ = [[ak_btn(("✅" if x in cur else "") + x, f"a:d:{i}") for i, x in enumerate(AK_DAYS)],
+               [ak_btn("Будни", "a:d:wk"), ak_btn("Выходные", "a:d:we"), ak_btn("Каждый день", "a:d:all")],
+               [ak_btn("⬅️ Назад", "a:back"), ak_btn("Далее ➡️", "a:next")]]
+    else:
+        cur = d.get("slots", [])
+        t = head + "Шаг 6/6. В какое время удобно играть? (время московское)"
+        kb_ = ak_grid([ak_btn(("✅ " if x in cur else "") + x, f"a:s:{i}") for i, x in enumerate(AK_SLOTS)], 2)
+        kb_.append([ak_btn("⬅️ Назад", "a:back"), ak_btn("✅ Готово", "a:done")])
+    kb_.append([ak_btn("✖️ Отмена", "a:cancel")])
+    return t, {"inline_keyboard": kb_}
+
+def ak_days_text(days):
+    idx = sorted(AK_DAYS.index(x) for x in days if x in AK_DAYS)
+    if len(idx) == 7: return "каждый день"
+    if idx == [0, 1, 2, 3, 4]: return "будни"
+    if idx == [5, 6]: return "выходные"
+    return ", ".join(AK_DAYS[i] for i in idx) or "—"
+
+def render_anketa(a, example=False):
+    from PIL import Image, ImageDraw
+    import io
+    games = a.get("games", []); W = 1080; RH = 112
+    H = 420 + RH * max(len(games), 1) + 230
+    im = Image.new("RGB", (W, H), (0, 0, 0)); d = ImageDraw.Draw(im)
+    for y in range(H):  # subtle vertical gradient
+        k = y / H; d.line([(0, y), (W, y)], fill=(int(10 + 8 * k), int(12 + 6 * k), int(22 + 18 * k)))
+    rnd = random.Random(a.get("uid", 7))
+    for _ in range(int(W * H / 3000)):
+        x, y = rnd.uniform(0, W), rnd.uniform(0, H); v = rnd.randint(40, 150); r = 0.6 if v < 120 else 1.0
+        d.ellipse((x - r, y - r, x + r, y + r), fill=(v, v, min(255, v + 20)))
+    try:
+        lg = Image.open(LOGO).convert("RGBA"); lg.thumbnail((150, 150)); im.paste(lg, (W - 60 - lg.size[0], 46), lg)
+    except Exception: pass
+    WH, GR, CY = (242, 242, 246), (140, 142, 156), (130, 195, 235)
+    d.text((60, 58), "АНКЕТА УЧАСТНИКА · LOBBY LINE", font=_font(24, 600), fill=CY)
+    nick = a.get("nick") or "Участник"; fn = _font(64, 700)
+    for sz in (64, 56, 48, 42):
+        fn = _font(sz, 700)
+        if d.textlength(nick, font=fn) <= W - 300: break
+    while d.textlength(nick, font=fn) > W - 300 and len(nick) > 2: nick = nick[:-2] + "…"
+    d.text((60, 96), nick, font=fn, fill=WH)
+    if a.get("username"): d.text((62, 180), "@" + a["username"], font=_font(28, 400), fill=GR)
+    # Steam level pill
+    lv = a.get("lvl") or "—"; lab = "Уровень Steam" if lv != "Нет Steam" else "Steam"
+    pf = _font(30, 600); pw = int(d.textlength(f"{lab}: {lv}", font=pf)) + 48
+    d.rounded_rectangle((60, 240, 60 + pw, 296), 28, fill=(28, 44, 66), outline=(70, 120, 170), width=2)
+    d.text((84, 268), f"{lab}: {lv}", font=pf, fill=WH, anchor="lm")
+    d.text((60, 340), "ИГРЫ", font=_font(22, 600), fill=GR)
+    y = 378; gf, hf, rf = _font(38, 600), _font(28, 500), _font(25, 400)
+    if not games: d.text((60, y + 20), "Игры не выбраны", font=gf, fill=GR)
+    for g in games:
+        d.rounded_rectangle((48, y, W - 48, y + RH - 14), 22, fill=(20, 24, 38), outline=(44, 52, 76), width=1)
+        d.text((78, y + 16), g, font=gf, fill=WH)
+        hrs = (a.get("hours") or {}).get(g, "")
+        if hrs: d.text((W - 78, y + 36), hrs, font=hf, fill=CY, anchor="rm")
+        roles = ", ".join((a.get("roles") or {}).get(g, [])) or "—"
+        while d.textlength(roles, font=rf) > W - 200 and len(roles) > 3: roles = roles[:-2] + "…"
+        d.text((80, y + 64), roles, font=rf, fill=GR)
+        y += RH
+    y += 26
+    d.text((60, y), "КОГДА УДОБНО ИГРАТЬ (МСК)", font=_font(22, 600), fill=GR)
+    d.text((60, y + 40), (lambda t: t[:1].upper() + t[1:])(ak_days_text(a.get("days", []))), font=_font(34, 600), fill=WH)
+    d.text((60, y + 90), " · ".join(a.get("slots", [])) or "время не указано", font=_font(28, 400), fill=CY)
+    d.text((60, H - 46), f"Обновлено {dt.datetime.now(MSK):%d.%m.%Y}", font=_font(19, 400), fill=GR)
+    if example:
+        stamp = Image.new("RGBA", (W, H), (0, 0, 0, 0)); sd = ImageDraw.Draw(stamp)
+        sd.text((W // 2, H // 2), "ПРИМЕР", font=_font(190, 800), fill=(255, 80, 80, 70), anchor="mm")
+        stamp = stamp.rotate(20, resample=Image.BICUBIC)
+        im = Image.alpha_composite(im.convert("RGBA"), stamp).convert("RGB"); d = ImageDraw.Draw(im)
+        d.rounded_rectangle((W - 420, H - 70, W - 48, H - 26), 18, fill=(150, 30, 30))
+        d.text((W - 234, H - 48), "ПРИМЕР · тестовые данные", font=_font(22, 600), fill=WH, anchor="mm")
+    b = io.BytesIO(); im.save(b, "PNG"); return b.getvalue()
+
+def anketa_caption(a, example=False):
+    gl = ", ".join(ak_short(g) for g in a.get("games", [])) or "—"
+    who = html.escape(a.get("nick") or "Участник") + (f" (@{html.escape(a['username'])})" if a.get("username") else "")
+    t = (f"🎮 <b>{who}</b>\nИгры: {html.escape(gl)}\nКогда: {ak_days_text(a.get('days', []))}, "
+         f"{html.escape(', '.join(a.get('slots', [])) or 'время не указано')} (МСК)")
+    return ("🧪 <b>ПРИМЕР</b> — тестовая анкета, данные выдуманы\n" if example else "") + t
+
+def ak_edit_or_send(chat, mid, text, markup):
+    if mid:
+        j = tg("editMessageText", chat_id=chat, message_id=mid, text=text, parse_mode="HTML", reply_markup=markup)
+        if j.get("ok") or "not modified" in (j.get("description") or ""): return mid
+    j = tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML", reply_markup=markup)
+    return j.get("result", {}).get("message_id")
+
+def anketa_start(chat, fu):
+    uid = fu["id"]
+    with lock:
+        s = load_state(); old = s.get("anketas", {}).get(str(uid)) or {}
+        d = {k: json.loads(json.dumps(old.get(k))) for k in ("lvl", "games", "hours", "roles", "days", "slots") if old.get(k) is not None}
+        d["lvl"] = AK_LEVELS.index(d["lvl"]) if d.get("lvl") in AK_LEVELS else None
+        d.update(step="lvl", gi=0, mid=None); s.setdefault("anketa_draft", {})[str(uid)] = d; save_state(s)
+    pre = "✏️ У тебя уже есть анкета — пройди шаги ещё раз, отмеченное сохранено.\n\n" if old else ""
+    t, m = ak_view(d); mid = ak_edit_or_send(chat, None, pre + t, m)
+    with lock:
+        s = load_state(); dd = s.get("anketa_draft", {}).get(str(uid))
+        if dd: dd["mid"] = mid; save_state(s)
+
+def anketa_publish(s, uid, a, png):
+    """Post or update the card in the «Анкеты» topic. Off unless ANKETA_PUBLISH=on."""
+    if not ANKETA_PUBLISH: return None
+    grp, th = s.get("group"), s.get("anketa_thread")
+    if not grp or not th: return None
+    pub = a.get("pub") or {}
+    if pub.get("mid"):
+        j = tg("editMessageMedia", files={"p": ("anketa.png", png, "image/png")}, chat_id=grp, message_id=pub["mid"],
+               media={"type": "photo", "media": "attach://p", "caption": anketa_caption(a), "parse_mode": "HTML"})
+        if j.get("ok"): return pub
+    j = tg("sendPhoto", files={"photo": ("anketa.png", png, "image/png")}, chat_id=grp, message_thread_id=th,
+           caption=anketa_caption(a), parse_mode="HTML", disable_notification=True)
+    return {"mid": j["result"]["message_id"]} if j.get("ok") else pub or None
+
+def anketa_finish(q, d):
+    fu = q["from"]; uid = fu["id"]; chat = q["message"]["chat"]["id"]
+    a = {"uid": uid, "nick": ak_nick(fu), "username": fu.get("username"), "lvl": AK_LEVELS[d["lvl"]] if d.get("lvl") is not None else None,
+         "games": d.get("games", []), "hours": {g: d.get("hours", {}).get(g) for g in d.get("games", []) if d.get("hours", {}).get(g)},
+         "roles": {g: d.get("roles", {}).get(g, []) for g in d.get("games", [])}, "days": d.get("days", []), "slots": d.get("slots", []),
+         "updated": int(time.time())}
+    with lock:
+        s = load_state(); old = s.setdefault("anketas", {}).get(str(uid)) or {}
+        a["dm"] = old.get("dm"); a["pub"] = old.get("pub"); s["anketas"][str(uid)] = a
+        s.get("anketa_draft", {}).pop(str(uid), None); save_state(s)
+    png = render_anketa(a); cap = anketa_caption(a)
+    mk = {"inline_keyboard": [[ak_btn("✏️ Изменить анкету", "a:start")]]}
+    if d.get("mid"): tg("deleteMessage", chat_id=chat, message_id=d["mid"])
+    dm = a.get("dm") or {}; ok = False
+    if dm.get("mid") and dm.get("chat") == chat:  # repeat /anketa edits the existing card
+        j = tg("editMessageMedia", files={"p": ("anketa.png", png, "image/png")}, chat_id=chat, message_id=dm["mid"],
+               media={"type": "photo", "media": "attach://p", "caption": cap, "parse_mode": "HTML"}, reply_markup=mk)
+        ok = j.get("ok")
+        if ok: tg("sendMessage", chat_id=chat, text="✅ Анкета обновлена — карточка выше изменена.", reply_to_message_id=dm["mid"])
+    if not ok:
+        j = tg("sendPhoto", files={"photo": ("anketa.png", png, "image/png")}, chat_id=chat, caption=cap, parse_mode="HTML", reply_markup=mk)
+        dm = {"chat": chat, "mid": j.get("result", {}).get("message_id")}
+    pub = anketa_publish(load_state(), uid, a, png)
+    with lock:
+        s = load_state(); x = s.get("anketas", {}).get(str(uid))
+        if x: x["dm"] = dm; x["pub"] = pub or x.get("pub"); save_state(s)
+    log.info("anketa saved for %s (%d games, published=%s)", uid, len(a["games"]), bool(pub))
+
+def on_anketa_btn(q):
+    uid = q["from"]["id"]; data = q["data"][2:]; chat = q["message"]["chat"]["id"]
+    if q["message"]["chat"].get("type") != "private": return tg("answerCallbackQuery", callback_query_id=q["id"])
+    if data == "start":
+        tg("answerCallbackQuery", callback_query_id=q["id"]); return anketa_start(chat, q["from"])
+    with lock:
+        s = load_state(); d = s.get("anketa_draft", {}).get(str(uid))
+        if not d:
+            save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], text="Анкета устарела, начни заново: /anketa", show_alert=True)
+        d["mid"] = q["message"]["message_id"]; act, _, arg = data.partition(":"); note = None; games = d.setdefault("games", [])
+        def tog(lst, v): lst.remove(v) if v in lst else lst.append(v)
+        if act == "cancel":
+            s["anketa_draft"].pop(str(uid)); save_state(s)
+            tg("answerCallbackQuery", callback_query_id=q["id"], text="Отменено")
+            return tg("editMessageText", chat_id=chat, message_id=d["mid"], text="Анкета отменена. Начать заново: /anketa")
+        if act == "lvl": d["lvl"] = int(arg); d["step"] = "games"
+        elif act == "g": tog(games, AK_GAMES[int(arg)]); games.sort(key=AK_GAMES.index)
+        elif act == "h":
+            d.setdefault("hours", {})[games[d["gi"]]] = AK_HOURS[int(arg)]
+            if d["gi"] + 1 < len(games): d["gi"] += 1
+            else: d["step"] = "roles"; d["gi"] = 0
+        elif act == "r": tog(d.setdefault("roles", {}).setdefault(games[d["gi"]], []), AK_ROLES[games[d["gi"]]][int(arg)])
+        elif act == "d":
+            cur = d.setdefault("days", [])
+            if arg == "wk": d["days"] = AK_DAYS[:5]
+            elif arg == "we": d["days"] = AK_DAYS[5:]
+            elif arg == "all": d["days"] = list(AK_DAYS)
+            else: tog(cur, AK_DAYS[int(arg)])
+        elif act == "s": tog(d.setdefault("slots", []), AK_SLOTS[int(arg)])
+        elif act == "next":
+            if d["step"] == "games":
+                if not games: note = "Выбери хотя бы одну игру"
+                else: d["step"] = "hours"; d["gi"] = 0
+            elif d["step"] == "roles":
+                if d["gi"] + 1 < len(games): d["gi"] += 1
+                else: d["step"] = "days"
+            elif d["step"] == "days":
+                if not d.get("days"): note = "Выбери хотя бы один день"
+                else: d["step"] = "slots"
+        elif act == "back":
+            st = d["step"]
+            if st in ("hours", "roles") and d["gi"] > 0: d["gi"] -= 1
+            elif st == "games": d["step"] = "lvl"
+            elif st == "hours": d["step"] = "games"
+            elif st == "roles": d["step"] = "hours"; d["gi"] = len(games) - 1
+            elif st == "days": d["step"] = "roles"; d["gi"] = len(games) - 1
+            elif st == "slots": d["step"] = "days"
+        elif act == "done":
+            if not d.get("slots"): note = "Выбери хотя бы одно время"
+            else: d["step"] = "finish"
+        save_state(s); d = json.loads(json.dumps(d))
+    if d["step"] == "finish":
+        tg("answerCallbackQuery", callback_query_id=q["id"], text="Рисую карточку… 🎨"); return anketa_finish(q, d)
+    tg("answerCallbackQuery", callback_query_id=q["id"], text=note or "", show_alert=False)
+    t, m = ak_view(d); tg("editMessageText", chat_id=chat, message_id=d["mid"], text=t, parse_mode="HTML", reply_markup=m)
+
+def ak_find_target(s, msg):
+    rm = msg.get("reply_to_message") or {}
+    fu = rm.get("from") or {}
+    if fu and not fu.get("is_bot") and not rm.get("forum_topic_created") and rm.get("message_id") != msg.get("message_thread_id"):
+        return fu["id"], ak_nick(fu)
+    arg = (msg.get("text") or "").partition(" ")[2].strip()
+    for e in msg.get("entities") or []:
+        if e["type"] == "text_mention": return e["user"]["id"], ak_nick(e["user"])
+    if arg.startswith("@"):
+        un = arg[1:].split()[0].lower(); uid = s.get("seen_users", {}).get(un)
+        if not uid: uid = next((int(k) for k, a in s.get("anketas", {}).items() if (a.get("username") or "").lower() == un), None)
+        return uid, "@" + un
+    if re.fullmatch(r"\d+", arg): return int(arg), arg
+    return msg["from"]["id"], ak_nick(msg["from"])  # no argument: own card
+
+def profile_cmd(msg, s):
+    chat = msg["chat"]["id"]; grp = msg["chat"]["type"] != "private"
+    extra = {"message_thread_id": msg["message_thread_id"]} if grp and msg.get("is_topic_message") else {}
+    def say(**kw):
+        j = tg("sendMessage" if "text" in kw else "sendPhoto", chat_id=chat, disable_notification=True, **extra, **kw)
+        if grp and j.get("ok"): del_later(chat, j["result"]["message_id"], 300)
+    if grp: del_later(chat, msg["message_id"], 60)
+    uid, who = ak_find_target(s, msg)
+    a = s.get("anketas", {}).get(str(uid)) if uid else None
+    if not a:
+        return say(text=f"У {html.escape(who)} пока нет анкеты. Заполнить: /anketa", parse_mode="HTML")
+    say(files={"photo": ("anketa.png", render_anketa(a), "image/png")}, caption=anketa_caption(a), parse_mode="HTML")
+
+def anketa_group_cmd(msg, s, cmd):
+    chat = msg["chat"]["id"]
+    if cmd == "/profile": return POOL.submit(_safe, "profile", profile_cmd, msg, s)
+    extra = {"message_thread_id": msg["message_thread_id"]} if msg.get("is_topic_message") else {}
+    un = BOT_UN[0] or "lobbyline_helper_bot"
+    j = tg("sendMessage", chat_id=chat, disable_notification=True, text="📝 Анкета заполняется в личке бота — жми кнопку 👇",
+           reply_markup={"inline_keyboard": [[{"text": "📝 Заполнить анкету", "url": f"https://t.me/{un}?start=anketa"}]]}, **extra)
+    del_later(chat, msg["message_id"], 30)
+    if j.get("ok"): del_later(chat, j["result"]["message_id"], 120)
+
+BOT_UN = [None]
+def ensure_anketa_topic():
+    s = load_state()
+    if s.get("anketa_thread") or not s.get("group"): return s.get("anketa_thread")
+    j = tg("createForumTopic", chat_id=s["group"], name=ANKETA_TOPIC_NAME, icon_color=7322096)
+    if not j.get("ok"): log.warning("createForumTopic Анкеты failed: %s", j.get("description")); return None
+    th = j["result"]["message_thread_id"]
+    with lock: s = load_state(); s["anketa_thread"] = th; save_state(s)
+    log.info("anketa topic created: %s", th); return th
+
 def on_update(u):
     for k in ("message", "callback_query", "inline_query", "chosen_inline_result"):
         if k in u:
@@ -1533,6 +1840,7 @@ def on_update(u):
                 if is_card:  # stays until its sender votes; safety delete after 60 s
                     del_later(msg["chat"]["id"], msg["message_id"], 60, f"{msg.get('from', {}).get('id')}:{_nt(t0.split(chr(10))[0][len('🗳 Голос за'):])}")
                 gc = t0.split()[0].split("@")[0] if t0.startswith("/") else ""
+                if gc in ("/anketa", "/profile"): anketa_group_cmd(msg, s, gc)
                 if gc in ("/vote", "/top", "/voters", "/stats", "/myvote") and in_vote_area(msg, s):
                     group_cmd(msg, load_state(), gc)
                 try: buffer_msg(msg)
@@ -1542,6 +1850,11 @@ def on_update(u):
                 if in_vote_area(msg, s2) and msg["message_id"] != sp.get("mid") and not is_card and not is_notice:
                     tg("deleteMessage", chat_id=msg["chat"]["id"], message_id=msg["message_id"])
             return
+        dcmd = txt.split(" ")[0].split("@")[0] if txt.startswith("/") else ""
+        if dcmd in ("/anketa", "/profile") or txt.strip() == "/start anketa":
+            if not ak_is_member(s, chat): return tg("sendMessage", chat_id=chat, text="Анкета доступна участникам чата «Lobby Line Чат» 🙂")
+            if dcmd == "/profile": return POOL.submit(_safe, "profile", profile_cmd, msg, s)
+            return anketa_start(chat, msg["from"])
         if s["owner"] is not None and not is_allowed(s, chat): return deny_dm(chat)
         if chat == s["owner"] and txt.split(" ")[0].split("@")[0] in ("/allow", "/deny", "/allowed"): return wl_cmd(msg, s, txt)
         if s["owner"] is not None and _chat_route(chat, txt): return
@@ -1573,6 +1886,7 @@ def on_update(u):
             s["group"] = c["id"]; s["group_title"] = c.get("title"); save_state(s); log.info("group via my_chat_member %s", c["id"])
     elif "callback_query" in u:
         q = u["callback_query"]; chat = q["from"]["id"]
+        if (q.get("data") or "").startswith("a:"): return on_anketa_btn(q)
         if q.get("message", {}).get("chat", {}).get("type") == "private" and not is_allowed(s, chat):
             tg("answerCallbackQuery", callback_query_id=q["id"], text="Бот закрытый 🔒", show_alert=True); return
         if (q.get("data") or "").startswith("st:"):
@@ -1647,8 +1961,9 @@ def main():
             json.dumps([{k: m[k] for k in ('type', 'url', 'path')} | {'bytes': os.path.getsize(m['path'])} for m in d['media']], ensure_ascii=False, indent=1) +
             f"\nYOUTUBE: {it['youtube']}\n\n{d['text']}\n"); print(out); return
     tg("setMyCommands", scope={"type": "all_private_chats"}, commands=[{"command": "ask", "description": "Спросить Gemini"},
-        {"command": "new", "description": "Новый диалог с Gemini (сбросить контекст)"}, {"command": "help", "description": "Помощь"}])
-    tg("setMyCommands", commands=[{"command": "draft", "description": "Сделать черновик сейчас"}, {"command": "updates", "description": "Последние обновления игр"}, {"command": "memes", "description": "Мемы на одобрение сейчас"}, {"command": "topics", "description": "Темы чата"}, {"command": "gamestats", "description": "Таблица: какие игры просят"}, {"command": "help", "description": "Помощь"}])
+        {"command": "new", "description": "Новый диалог с Gemini (сбросить контекст)"}, {"command": "anketa", "description": "Заполнить / изменить анкету"},
+        {"command": "profile", "description": "Анкета участника: /profile @ник"}, {"command": "help", "description": "Помощь"}])
+    tg("setMyCommands", commands=[{"command": "draft", "description": "Сделать черновик сейчас"}, {"command": "updates", "description": "Последние обновления игр"}, {"command": "memes", "description": "Мемы на одобрение сейчас"}, {"command": "topics", "description": "Темы чата"}, {"command": "gamestats", "description": "Таблица: какие игры просят"}, {"command": "anketa", "description": "Заполнить / изменить анкету"}, {"command": "profile", "description": "Анкета участника: /profile @ник"}, {"command": "help", "description": "Помощь"}])
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=update_loop, daemon=True).start()
     threading.Thread(target=meme_loop, daemon=True).start()
@@ -1668,7 +1983,9 @@ def main():
         if s2.get("vote_thread") and (s2.get("statspost") or {}).get("th") != s2.get("vote_thread"):
             threading.Thread(target=run_job, args=("chart", publish_stats), kwargs={"limit": 180}, daemon=True).start()
     except Exception: log.exception("vote topic")
-    BOT_ID[0] = tg("getMe").get("result", {}).get("id")
+    me = tg("getMe").get("result", {}); BOT_ID[0] = me.get("id"); BOT_UN[0] = me.get("username")
+    try: log.info("anketa topic: %s, publish=%s", ensure_anketa_topic(), ANKETA_PUBLISH)
+    except Exception: log.exception("anketa topic")
     g0 = load_state().get("group")
     if g0: tg("setMyCommands", commands=GROUP_CMDS, scope={"type": "chat", "chat_id": g0})
     threading.Thread(target=watchdog, daemon=True).start()
