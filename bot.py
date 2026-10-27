@@ -914,7 +914,7 @@ def topic_button(s, title):
     te = topic_entry(s, title)
     if not te: return None
     k, e = te; ln = topic_link(s, e.get("th"))
-    return {"inline_keyboard": [[{"text": f"🎮 {k} → перейти", "url": ln}]]} if ln else None
+    return {"inline_keyboard": [[{"text": f"Жми сюда 👉 🎮 {k}", "url": ln}]]} if ln else None
 def topic_jump_msg(chat, title):
     """Short notice with a jump button; removed after 60 s (vote not counted, wallet untouched)."""
     s = load_state(); te = topic_entry(s, title); k = te[0] if te else title; kb = topic_button(s, title)
@@ -926,7 +926,7 @@ def topic_notice(s, title):
     k, e = topic_entry(s, title); ln = topic_link(s, e.get("th")); ic = e.get("icon")
     icon = f'<tg-emoji emoji-id="{ic}">🎮</tg-emoji>' if ic else "🎮"
     name = html.escape(k)
-    return f"{icon} Тема про <b>{name}</b> уже есть в чате 👉 " + (f'<a href="{ln}">открыть тему</a>' if ln else "загляните в список тем")
+    return f"Тема про <b>{name}</b> уже есть в чате.\n" + (f'Жми сюда 👉 {icon} <a href="{ln}">{name}</a>' if ln else f"Ищи её в списке тем 👉 {icon} {name}")
 def epic_search(term):
     try:
         r = requests.get("https://store.epicgames.com/graphql", headers=BUA, timeout=6, params={
