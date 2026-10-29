@@ -1570,23 +1570,57 @@ AK_SEQ = {"manual": ["mode", "lvl", "games", "hours", "roles", "days", "slots"],
 def ak_pos(d):
     seq = AK_SEQ.get(d.get("src") or "manual"); st = d["step"]
     return (seq.index(st) + 1 if st in seq else 1), len(seq)
-def steam_id_from(text):
-    t = (text or "").strip()
-    m = re.search(r"steamcommunity\.com/profiles/(\d{17})", t) or re.fullmatch(r"(\d{17})", t)
-    if m: return m.group(1)
-    m = re.search(r"steamcommunity\.com/id/([A-Za-z0-9_.-]+)", t)
-    if not m: return None
-    j = requests.get("https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/", params={"key": STEAM_KEY, "vanityurl": m.group(1)}).json()
-    r = j.get("response", {})
+STEAM_API_ERR = [None]
+def _steam_api(method, **params):
+    r = requests.get(f"https://api.steampowered.com/{method}", params={"key": STEAM_KEY, **params})
+    if r.status_code in (401, 403):
+        STEAM_API_ERR[0] = r.status_code; raise RuntimeError(f"steam key rejected {r.status_code}")
+    r.raise_for_status(); return r.json().get("response", {})
+def _resolve_vanity(name):
+    r = _steam_api("ISteamUser/ResolveVanityURL/v1/", vanityurl=name)
     return r.get("steamid") if r.get("success") == 1 else None
+def _sid_from_url(u, depth=0):
+    m = re.search(r"steamcommunity\.com/profiles/\[?(\d{17})", u, re.I)
+    if m: return m.group(1), None
+    m = re.search(r"steamcommunity\.com/id/([^/?#\s]+)", u, re.I)
+    if m: return _resolve_vanity(m.group(1)), f"ник «{m.group(1)}» не найден в Steam"
+    m = re.search(r"(?:s\.team/p|steamcommunity\.com/user)/([bcdfghjkmnpqrtvw-]{1,12})(?:/|$|\?)", u, re.I)
+    if m:  # Steam «Поделиться» link: friend code = account id in hex, digits mapped to bcdfghjkmnpqrtvw
+        code = m.group(1).replace("-", "").lower()
+        acc = int("".join("0123456789abcdef"["bcdfghjkmnpqrtvw".index(c)] for c in code), 16)
+        if acc: return str(76561197960265728 + acc), None
+    if re.search(r"(^|//|\.)s\.team/|steamcommunity\.com/(user|my)\b", u, re.I) and depth < 2:
+        url = u if re.match(r"https?://", u, re.I) else "https://" + u
+        try:
+            r = requests.get(url, headers=BUA, allow_redirects=True, timeout=(10, 20))
+        except requests.RequestException: return None, "короткая ссылка не открылась"
+        if r.url != url:
+            sid, why = _sid_from_url(r.url, depth + 1)
+            if sid: return sid, None
+        m = re.search(r'"steamid"\s*:\s*"(\d{17})"', r.text) or re.search(r"g_rgProfileData\s*=\s*\{[^}]*?\"steamid\":\"(\d{17})\"", r.text)
+        if m: return m.group(1), None
+        return None, "короткая ссылка не привела к профилю"
+    return None, None
+def steam_id_from(text):
+    """Any form -> (steamid or None, reason if not recognized)."""
+    t = (text or "").strip().strip("<>").strip()
+    urls = re.findall(r"(?:https?://)?(?:[\w-]+\.)*(?:steamcommunity\.com|s\.team)/\S+", t, re.I)
+    for u in urls:
+        sid, why = _sid_from_url(u.rstrip(".,)»"))
+        if sid: return sid, None
+        if why: return None, why
+    if urls: return None, "это не ссылка на профиль"
+    m = re.fullmatch(r"(7656119\d{10})", t)
+    if m: return m.group(1), None
+    if re.fullmatch(r"[A-Za-z0-9_-]{2,32}", t):
+        sid = _resolve_vanity(t); return (sid, None) if sid else (None, f"ник «{t}» не найден в Steam")
+    return None, "не похоже на ссылку Steam"
 def ak_fmt_hours(h):
     return f"{h:,}".replace(",", " ") + " ч"
 def steam_fetch(sid):
     """-> (level or None, {game: hours}, games_visible: bool)"""
-    lv = requests.get("https://api.steampowered.com/IPlayerService/GetSteamLevel/v1/", params={"key": STEAM_KEY, "steamid": sid}).json()
-    level = lv.get("response", {}).get("player_level")
-    og = requests.get("https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/",
-                      params={"key": STEAM_KEY, "steamid": sid, "include_played_free_games": 1, "include_appinfo": 0}).json().get("response", {})
+    level = _steam_api("IPlayerService/GetSteamLevel/v1/", steamid=sid).get("player_level")
+    og = _steam_api("IPlayerService/GetOwnedGames/v1/", steamid=sid, include_played_free_games=1, include_appinfo=0)
     if "games" not in og: return level, {}, False
     mins = {g["appid"]: g.get("playtime_forever", 0) for g in og["games"]}
     hours = {}
@@ -1598,8 +1632,8 @@ def ak_steam_link(chat, uid, text):
     """User sent a Steam link while on the 'link' step."""
     err = None; res = None
     try:
-        sid = steam_id_from(text)
-        if not sid: err = "🤔 Не похоже на ссылку на профиль Steam. Пришли вида\nsteamcommunity.com/profiles/7656…\nили steamcommunity.com/id/ник"
+        sid, why = steam_id_from(text)
+        if not sid: err = f"⚠️ Не узнал ссылку: «{html.escape(text.strip()[:60])}» — {why or 'не похоже на профиль Steam'}.\nПришли вида steamcommunity.com/profiles/7656… или steamcommunity.com/id/ник"
         else:
             level, hours, vis = steam_fetch(sid)
             if not vis: err = ("🔒 Профиль или список игр скрыт.\nОткрой в Steam: <b>Профиль → Редактировать → Приватность → «Игры» = Открытый</b>, "
@@ -1607,7 +1641,10 @@ def ak_steam_link(chat, uid, text):
             elif not hours: err = "🕹 В профиле не нашлось наших игр со временем в игре. Можно заполнить анкету вручную."
             else: res = (sid, level, hours)
     except Exception as e:
-        log.warning("steam fetch: %s", type(e).__name__); err = "⚠️ Steam сейчас не отвечает. Попробуй позже или заполни вручную."
+        log.warning("steam fetch: %s %s", type(e).__name__, e)
+        err = ("⚠️ Steam не принял ключ бота — режим Steam временно не работает, заполни вручную." if "key rejected" in str(e)
+               else "⚠️ Steam сейчас не отвечает. Попробуй позже или заполни вручную.")
+    log.info("steam link from %s: %s", uid, "ok" if res else (err or "")[:80].replace("\n", " "))
     with lock:
         s = load_state(); d = s.get("anketa_draft", {}).get(str(uid))
         if not d or d.get("step") != "link": return
@@ -1615,7 +1652,8 @@ def ak_steam_link(chat, uid, text):
             sid, level, hours = res
             d.update(steamid=sid, lvl_text=str(level) if level is not None else None, games=[g for g in AK_GAMES if g in hours],
                      hours={g: ak_fmt_hours(h) for g, h in hours.items()}, step="roles", gi=0, err=None)
-        else: d["err"] = err
+        else:
+            d["tries"] = d.get("tries", 0) + 1; d["err"] = err + f"\n<i>(попытка {d['tries']})</i>"   # never an identical caption
         save_state(s); d = json.loads(json.dumps(d))
     ak_show(chat, d.get("mid"), d, new_step=bool(res))
 def render_banner(step, n=None, total=6, intro=False):
@@ -1999,8 +2037,10 @@ def anketa_group_cmd(msg, s, cmd):
 BOT_UN = [None]
 def anketa_topic_msg(msg, s):
     """«Анкеты» topic stays clean: only the pinned post, cards and live questionnaires. Steam links are read, then removed."""
-    chat = msg["chat"]["id"]; uid = (msg.get("from") or {}).get("id"); txt = msg.get("text") or ""
+    chat = msg["chat"]["id"]; uid = (msg.get("from") or {}).get("id"); txt = msg.get("text") or msg.get("caption") or ""
     d = s.get("anketa_draft", {}).get(str(uid)) or {}
+    links = [e["url"] for e in (msg.get("entities") or msg.get("caption_entities") or []) if e.get("type") == "text_link"]
+    if links and d.get("step") == "link": txt = (txt + " " + " ".join(links)).strip()
     if txt and not txt.startswith("/") and d.get("step") == "link" and d.get("chat") == chat:
         POOL.submit(_safe, "steamlink", ak_steam_link, chat, uid, txt)
     elif txt.startswith("/profile"): anketa_group_cmd(msg, s, "/profile")
