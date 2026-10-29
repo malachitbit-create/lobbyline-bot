@@ -1866,12 +1866,13 @@ def ak_edit_or_send(chat, mid, text, markup):
 
 def anketa_start(chat, fu, th=None):
     uid = fu["id"]
+    if uid == ANON_BOT: return
     with lock:
         s = load_state(); old = s.get("anketas", {}).get(str(uid)) or {}
         prevd = s.get("anketa_draft", {}).get(str(uid)) or {}
         d = {k: json.loads(json.dumps(old.get(k))) for k in ("lvl", "games", "hours", "roles", "days", "slots") if old.get(k) is not None}
         d["lvl"] = AK_LEVELS.index(d["lvl"]) if d.get("lvl") in AK_LEVELS else None
-        d.update(step="mode", gi=0, mid=None, src=None, err=None, chat=chat, th=th,
+        d.update(t=time.time(), step="mode", gi=0, mid=None, src=None, err=None, chat=chat, th=th,
                  who=f"👤 <b>{html.escape(ak_nick(fu))}</b> заполняет анкету\n\n" if th else ""); s.setdefault("anketa_draft", {})[str(uid)] = d; ak_save_state(s)
     pre = "✏️ <i>Анкета уже есть — проходим заново, прежние ответы отмечены ✅</i>\n\n" if old else ""
     if prevd.get("mid") and prevd.get("chat"): tg("deleteMessage", chat_id=prevd["chat"], message_id=prevd["mid"])
@@ -1896,6 +1897,7 @@ def anketa_publish(s, uid, a, png):
 
 def anketa_finish(q, d):
     fu = q["from"]; uid = fu["id"]; chat = q["message"]["chat"]["id"]
+    if uid == ANON_BOT: return
     a = {"uid": uid, "nick": ak_nick(fu), "username": fu.get("username"), "lvl": d.get("lvl_text") if d.get("src") == "steam" else (AK_LEVELS[d["lvl"]] if d.get("lvl") is not None else None),
          "src": d.get("src") or "manual", "steamid": d.get("steamid"),
          "games": d.get("games", []), "hours": {g: d.get("hours", {}).get(g) for g in d.get("games", []) if d.get("hours", {}).get(g)},
@@ -1951,7 +1953,7 @@ def on_anketa_btn(q):
         s = load_state(); d = s.get("anketa_draft", {}).get(str(uid))
         if not d:
             ak_save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], text="Анкета устарела, начни заново: /anketa", show_alert=True)
-        d["mid"] = q["message"]["message_id"]; prev = (d["step"], d.get("gi", 0)); act, _, arg = data.partition(":"); note = None; games = d.setdefault("games", [])
+        d["t"] = time.time(); d["mid"] = q["message"]["message_id"]; prev = (d["step"], d.get("gi", 0)); act, _, arg = data.partition(":"); note = None; games = d.setdefault("games", [])
         def tog(lst, v): lst.remove(v) if v in lst else lst.append(v)
         if act == "cancel":
             s["anketa_draft"].pop(str(uid)); ak_save_state(s)
@@ -2049,10 +2051,35 @@ def anketa_group_cmd(msg, s, cmd):
     if j.get("ok"): del_later(chat, j["result"]["message_id"], 120)
 
 BOT_UN = [None]
+ANON_BOT = 1087968824   # GroupAnonymousBot: messages of anonymous admins
+def ak_cleanup_anon():
+    with lock:
+        s = load_state(); d = s.get("anketa_draft", {}).pop(str(ANON_BOT), None); a = s.get("anketas", {}).pop(str(ANON_BOT), None)
+        if d is None and a is None: return
+        ak_save_state(s)
+    for c, m in [((d or {}).get("chat"), (d or {}).get("mid")), (s.get("group"), ((a or {}).get("topic") or {}).get("mid")),
+                 (s.get("group"), ((a or {}).get("pub") or {}).get("mid"))]:
+        if c and m: tg("deleteMessage", chat_id=c, message_id=m)
+    log.info("anketa: removed anonymous-admin session/card")
 AK_LINK_RE = re.compile(r"steamcommunity\.com/|s\.team/|\b7656119\d{10}\b", re.I)
 def anketa_topic_msg(msg, s):
     """«Анкеты» topic stays clean: only the pinned post, cards and live questionnaires. Steam links are read, then removed."""
     chat = msg["chat"]["id"]; uid = (msg.get("from") or {}).get("id"); txt = msg.get("text") or msg.get("caption") or ""
+    anon = uid == ANON_BOT or (msg.get("sender_chat") or {}).get("id") == chat
+    if anon:   # anonymous admin: attach to the waiting Steam session in this topic, never create one for GroupAnonymousBot
+        waiting = sorted(((v.get("t", 0), k) for k, v in s.get("anketa_draft", {}).items()
+                          if k != str(ANON_BOT) and v.get("chat") == chat and v.get("step") == "link"), reverse=True)
+        pick = waiting[0][1] if len(waiting) == 1 or (waiting and time.time() - waiting[0][0] < 900) else None
+        log.info("anketa route: anonymous admin msg, waiting sessions=%d, attached=%s", len(waiting), pick)
+        if pick and txt and not txt.startswith("/"):
+            links = [e["url"] for e in (msg.get("entities") or msg.get("caption_entities") or []) if e.get("type") == "text_link"]
+            POOL.submit(_safe, "steamlink", ak_steam_link, chat, int(pick), (txt + " " + " ".join(links)).strip())
+        elif txt.startswith("/profile"): anketa_group_cmd(msg, s, "/profile")
+        else:
+            j = tg("sendMessage", chat_id=chat, message_thread_id=msg.get("message_thread_id") or s.get("anketa_thread"), disable_notification=True,
+                   text="🕶 Ты пишешь анонимно — нажми «📝 Анкета» и пришли ссылку, или отключи анонимность.")
+            if j.get("ok"): del_later(chat, j["result"]["message_id"], 60)
+        return tg("deleteMessage", chat_id=chat, message_id=msg["message_id"])
     d = s.get("anketa_draft", {}).get(str(uid)) or {}
     links = [e["url"] for e in (msg.get("entities") or msg.get("caption_entities") or []) if e.get("type") == "text_link"]
     if links: txt = (txt + " " + " ".join(links)).strip()
@@ -2066,7 +2093,7 @@ def anketa_topic_msg(msg, s):
         with lock:
             s2 = load_state(); dd = s2.setdefault("anketa_draft", {}).get(str(uid)) or {}
             if dd.get("chat") != chat: dd = {"mid": None}
-            dd.update(step="link", src="steam", gi=0, err=None, chat=chat, th=s2.get("anketa_thread"),
+            dd.update(t=time.time(), step="link", src="steam", gi=0, err=None, chat=chat, th=s2.get("anketa_thread"),
                       who=f"👤 <b>{html.escape(ak_nick(fu))}</b> заполняет анкету\n\n")
             s2["anketa_draft"][str(uid)] = dd; ak_save_state(s2); d = dd
     if txt and not txt.startswith("/") and d.get("step") == "link" and d.get("chat") == chat:
@@ -2260,7 +2287,7 @@ def main():
             threading.Thread(target=run_job, args=("chart", publish_stats), kwargs={"limit": 180}, daemon=True).start()
     except Exception: log.exception("vote topic")
     me = tg("getMe").get("result", {}); BOT_ID[0] = me.get("id"); BOT_UN[0] = me.get("username")
-    try: log.info("anketa topic: %s, publish=%s", ensure_anketa_topic(), ANKETA_PUBLISH)
+    try: ak_cleanup_anon(); log.info("anketa topic: %s, publish=%s", ensure_anketa_topic(), ANKETA_PUBLISH)
     except Exception: log.exception("anketa topic")
     g0 = load_state().get("group")
     if g0: tg("setMyCommands", commands=GROUP_CMDS, scope={"type": "chat", "chat_id": g0})
