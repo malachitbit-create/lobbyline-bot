@@ -81,11 +81,21 @@ def watchdog():
         if age > 300:
             log.error("watchdog: heartbeat is %ds old, polling hung; exiting for restart", age)
             logging.shutdown(); os._exit(1)
+AK_FILE = os.path.join(DATA, "anketa.json")          # questionnaire sessions + cards: own file, never overwritten by stale state copies
+AK_KEYS = ("anketa_draft", "anketas")
 def load_state():
-    try: return json.load(open(STATE))
-    except Exception: return {"owner": None, "used": [], "drafts": {}}
+    try: s = json.load(open(STATE))
+    except Exception: s = {"owner": None, "used": [], "drafts": {}}
+    try: ak = json.load(open(AK_FILE))
+    except Exception: ak = {k: s.get(k) or {} for k in AK_KEYS}   # first run: migrate from state.json
+    s.update({k: ak.get(k) or {} for k in AK_KEYS}); return s
 def save_state(s):
-    tmp = STATE + ".tmp"; json.dump(s, open(tmp, "w"), ensure_ascii=False, indent=1); os.replace(tmp, STATE)
+    """Saves everything except questionnaire data (only ak_save_state writes that, under `lock`)."""
+    out = {k: v for k, v in s.items() if k not in AK_KEYS}
+    tmp = STATE + ".tmp"; json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1); os.replace(tmp, STATE)
+def ak_save_state(s):
+    tmp = AK_FILE + ".tmp"; json.dump({k: s.get(k) or {} for k in AK_KEYS}, open(tmp, "w"), ensure_ascii=False, indent=1); os.replace(tmp, AK_FILE)
+    save_state(s)
 
 # ---------- telegram ----------
 def tg(method, files=None, **params):
@@ -1654,8 +1664,12 @@ def ak_steam_link(chat, uid, text):
                      hours={g: ak_fmt_hours(h) for g, h in hours.items()}, step="roles", gi=0, err=None)
         else:
             d["tries"] = d.get("tries", 0) + 1; d["err"] = err + f"\n<i>(попытка {d['tries']})</i>"   # never an identical caption
-        save_state(s); d = json.loads(json.dumps(d))
-    ak_show(chat, d.get("mid"), d, new_step=bool(res))
+        ak_save_state(s); d = json.loads(json.dumps(d))
+    mid = ak_show(chat, d.get("mid"), d, new_step=bool(res) or not d.get("mid"))
+    if mid and mid != d.get("mid"):
+        with lock:
+            s = load_state(); dd = s.get("anketa_draft", {}).get(str(uid))
+            if dd: dd["mid"] = mid; ak_save_state(s)
 def render_banner(step, n=None, total=6, intro=False):
     """Holographic LL banner in the avatar style for one questionnaire step."""
     from PIL import Image, ImageDraw, ImageFilter
@@ -1858,13 +1872,13 @@ def anketa_start(chat, fu, th=None):
         d = {k: json.loads(json.dumps(old.get(k))) for k in ("lvl", "games", "hours", "roles", "days", "slots") if old.get(k) is not None}
         d["lvl"] = AK_LEVELS.index(d["lvl"]) if d.get("lvl") in AK_LEVELS else None
         d.update(step="mode", gi=0, mid=None, src=None, err=None, chat=chat, th=th,
-                 who=f"👤 <b>{html.escape(ak_nick(fu))}</b> заполняет анкету\n\n" if th else ""); s.setdefault("anketa_draft", {})[str(uid)] = d; save_state(s)
+                 who=f"👤 <b>{html.escape(ak_nick(fu))}</b> заполняет анкету\n\n" if th else ""); s.setdefault("anketa_draft", {})[str(uid)] = d; ak_save_state(s)
     pre = "✏️ <i>Анкета уже есть — проходим заново, прежние ответы отмечены ✅</i>\n\n" if old else ""
     if prevd.get("mid") and prevd.get("chat"): tg("deleteMessage", chat_id=prevd["chat"], message_id=prevd["mid"])
     mid = ak_show(chat, None, d, pre)
     with lock:
         s = load_state(); dd = s.get("anketa_draft", {}).get(str(uid))
-        if dd: dd["mid"] = mid; save_state(s)
+        if dd: dd["mid"] = mid; ak_save_state(s)
 
 def anketa_publish(s, uid, a, png):
     """Post or update the card in the «Анкеты» topic. Off unless ANKETA_PUBLISH=on."""
@@ -1890,7 +1904,7 @@ def anketa_finish(q, d):
     with lock:
         s = load_state(); old = s.setdefault("anketas", {}).get(str(uid)) or {}
         a["dm"] = old.get("dm"); a["pub"] = old.get("pub"); a["topic"] = old.get("topic"); s["anketas"][str(uid)] = a
-        s.get("anketa_draft", {}).pop(str(uid), None); save_state(s)
+        s.get("anketa_draft", {}).pop(str(uid), None); ak_save_state(s)
     png = render_anketa(a); cap = anketa_caption(a)
     mk = {"inline_keyboard": [[ak_btn("✏️ Изменить анкету", "a:start")]]}
     if d.get("mid"): tg("deleteMessage", chat_id=chat, message_id=d["mid"])
@@ -1901,7 +1915,7 @@ def anketa_finish(q, d):
                parse_mode="HTML", disable_notification=True, reply_markup={"inline_keyboard": [[ak_btn("📝 Заполнить / изменить свою", "a:go")]]})
         with lock:
             s = load_state(); x = s.get("anketas", {}).get(str(uid))
-            if x and j.get("ok"): x["topic"] = {"mid": j["result"]["message_id"]}; x["pub"] = None; save_state(s)
+            if x and j.get("ok"): x["topic"] = {"mid": j["result"]["message_id"]}; x["pub"] = None; ak_save_state(s)
         log.info("anketa card in topic for %s (%d games)", uid, len(a["games"])); return
     dm = a.get("dm") or {}; ok = False
     if dm.get("mid") and dm.get("chat") == chat:  # repeat /anketa edits the existing card
@@ -1915,7 +1929,7 @@ def anketa_finish(q, d):
     pub = anketa_publish(load_state(), uid, a, png)
     with lock:
         s = load_state(); x = s.get("anketas", {}).get(str(uid))
-        if x: x["dm"] = dm; x["pub"] = pub or x.get("pub"); save_state(s)
+        if x: x["dm"] = dm; x["pub"] = pub or x.get("pub"); ak_save_state(s)
     log.info("anketa saved for %s (%d games, published=%s)", uid, len(a["games"]), bool(pub))
 
 def on_anketa_btn(q):
@@ -1936,17 +1950,17 @@ def on_anketa_btn(q):
     with lock:
         s = load_state(); d = s.get("anketa_draft", {}).get(str(uid))
         if not d:
-            save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], text="Анкета устарела, начни заново: /anketa", show_alert=True)
+            ak_save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], text="Анкета устарела, начни заново: /anketa", show_alert=True)
         d["mid"] = q["message"]["message_id"]; prev = (d["step"], d.get("gi", 0)); act, _, arg = data.partition(":"); note = None; games = d.setdefault("games", [])
         def tog(lst, v): lst.remove(v) if v in lst else lst.append(v)
         if act == "cancel":
-            s["anketa_draft"].pop(str(uid)); save_state(s)
+            s["anketa_draft"].pop(str(uid)); ak_save_state(s)
             tg("answerCallbackQuery", callback_query_id=q["id"], text="Отменено")
             if grp: return tg("deleteMessage", chat_id=chat, message_id=d["mid"])
             return tg("editMessageCaption", chat_id=chat, message_id=d["mid"], caption="✖ Анкета отменена. Вернуться можно в любой момент: /anketa", reply_markup={"inline_keyboard": []})
         if act == "m":
             if arg == "steam" and not STEAM_KEY:
-                save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], show_alert=True,
+                ak_save_state(s); return tg("answerCallbackQuery", callback_query_id=q["id"], show_alert=True,
                     text="🔗 Режим через Steam временно недоступен. Заполни анкету вручную — это пара минут ✍️")
             d["src"] = arg; d["err"] = None; d["gi"] = 0
             if arg == "manual":
@@ -1990,7 +2004,7 @@ def on_anketa_btn(q):
         elif act == "done":
             if not d.get("slots"): note = "Выбери хотя бы одно время"
             else: d["step"] = "finish"
-        save_state(s); d = json.loads(json.dumps(d))
+        ak_save_state(s); d = json.loads(json.dumps(d))
     if d["step"] == "finish":
         tg("answerCallbackQuery", callback_query_id=q["id"], text="Рисую карточку… 🎨"); return anketa_finish(q, d)
     tg("answerCallbackQuery", callback_query_id=q["id"], text=note or "", show_alert=False)
@@ -2035,12 +2049,26 @@ def anketa_group_cmd(msg, s, cmd):
     if j.get("ok"): del_later(chat, j["result"]["message_id"], 120)
 
 BOT_UN = [None]
+AK_LINK_RE = re.compile(r"steamcommunity\.com/|s\.team/|\b7656119\d{10}\b", re.I)
 def anketa_topic_msg(msg, s):
     """«Анкеты» topic stays clean: only the pinned post, cards and live questionnaires. Steam links are read, then removed."""
     chat = msg["chat"]["id"]; uid = (msg.get("from") or {}).get("id"); txt = msg.get("text") or msg.get("caption") or ""
     d = s.get("anketa_draft", {}).get(str(uid)) or {}
     links = [e["url"] for e in (msg.get("entities") or msg.get("caption_entities") or []) if e.get("type") == "text_link"]
-    if links and d.get("step") == "link": txt = (txt + " " + " ".join(links)).strip()
+    if links: txt = (txt + " " + " ".join(links)).strip()
+    steamish = bool(txt) and not txt.startswith("/") and bool(AK_LINK_RE.search(txt))
+    log.info("anketa route: uid=%s thread=%s topic_msg=%s reply=%s text=%s caption=%s steamish=%s draft=%s/%s",
+             uid, msg.get("message_thread_id"), msg.get("is_topic_message"), bool(msg.get("reply_to_message")), bool(msg.get("text")),
+             bool(msg.get("caption")), steamish, d.get("step"), "topic" if d.get("chat") == chat else ("dm" if d else "-"))
+    if steamish and not (d.get("step") == "link" and d.get("chat") == chat) and uid:
+        # no waiting session here: start Steam mode for this person right away (keeps their live step message if any)
+        fu = msg["from"]
+        with lock:
+            s2 = load_state(); dd = s2.setdefault("anketa_draft", {}).get(str(uid)) or {}
+            if dd.get("chat") != chat: dd = {"mid": None}
+            dd.update(step="link", src="steam", gi=0, err=None, chat=chat, th=s2.get("anketa_thread"),
+                      who=f"👤 <b>{html.escape(ak_nick(fu))}</b> заполняет анкету\n\n")
+            s2["anketa_draft"][str(uid)] = dd; ak_save_state(s2); d = dd
     if txt and not txt.startswith("/") and d.get("step") == "link" and d.get("chat") == chat:
         POOL.submit(_safe, "steamlink", ak_steam_link, chat, uid, txt)
     elif txt.startswith("/profile"): anketa_group_cmd(msg, s, "/profile")
@@ -2053,7 +2081,7 @@ def ensure_anketa_topic():
     j = tg("createForumTopic", chat_id=s["group"], name=ANKETA_TOPIC_NAME, icon_color=7322096)
     if not j.get("ok"): log.warning("createForumTopic Анкеты failed: %s", j.get("description")); return None
     th = j["result"]["message_thread_id"]
-    with lock: s = load_state(); s["anketa_thread"] = th; save_state(s)
+    with lock: s = load_state(); s["anketa_thread"] = th; ak_save_state(s)
     log.info("anketa topic created: %s", th); return th
 
 def on_update(u):
@@ -2067,9 +2095,12 @@ def on_update(u):
     if "message" in u:
         msg = u["message"]; chat = msg["chat"]["id"]; txt = msg.get("text", "")
         if msg["chat"]["type"] != "private":
-            if msg["chat"]["type"] == "supergroup" and chat == s.get("group") and s.get("anketa_thread") \
-                    and msg.get("is_topic_message") and msg.get("message_thread_id") == s.get("anketa_thread"):
+            mth = msg.get("message_thread_id") or (msg.get("reply_to_message") or {}).get("message_thread_id")
+            if msg["chat"]["type"] == "supergroup" and chat == s.get("group") and s.get("anketa_thread") and mth == s.get("anketa_thread"):
                 return anketa_topic_msg(msg, s)
+            if msg["chat"]["type"] == "supergroup" and AK_LINK_RE.search((msg.get("text") or msg.get("caption") or "")):
+                log.info("anketa route: steam-like msg from %s outside topic: thread=%s topic_msg=%s reply=%s", (msg.get("from") or {}).get("id"),
+                         msg.get("message_thread_id"), msg.get("is_topic_message"), bool(msg.get("reply_to_message")))
             if msg["chat"]["type"] == "supergroup":
                 handle_group(msg, s)
                 t0 = msg.get("text") or ""
@@ -2192,6 +2223,8 @@ def scheduler():
 
 def main():
     os.makedirs(MEDIA_DIR, exist_ok=True)
+    if not os.path.exists(AK_FILE):
+        with lock: ak_save_state(load_state()); log.info("anketa data moved to %s", AK_FILE)
     if len(sys.argv) > 1 and sys.argv[1] == "memetest":
         seen = set(load_state().get("meme_seen", []))
         for g in GAMES:
