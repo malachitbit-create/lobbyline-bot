@@ -1678,7 +1678,9 @@ def ak_view(d):
         return t, {"inline_keyboard": [[ak_btn("🔗 Вставить ссылку на Steam", "a:m:steam")], [ak_btn("✍️ Заполнить вручную", "a:m:manual")],
                                        [ak_btn(AK_NAV_X, "a:cancel")]]}
     if st == "link":
-        t = head + (d.get("err") or "Пришли сообщением ссылку на свой профиль Steam 👇\n<i>steamcommunity.com/profiles/7656…</i> или <i>steamcommunity.com/id/ник</i>\n\n"
+        t = head + ((d["err"] + "\n\n💡 Ссылка: Steam → профиль → «Поделиться» → «Скопировать ссылку» или steamcommunity.com/my") if d.get("err") else ("Ответь в теме ссылкой на свой профиль Steam 👇" if d.get("th") else "Пришли сообщением ссылку на свой профиль Steam 👇") + "\n<i>steamcommunity.com/profiles/7656…</i> или <i>steamcommunity.com/id/ник</i>\n\n"
+                    "💡 <b>Где взять ссылку:</b> Steam → свой профиль → «Поделиться» → «Скопировать ссылку», "
+                    "или открой steamcommunity.com/my — там будет твоя ссылка.\n"
                     "Список игр в профиле должен быть открыт (Приватность → «Игры»).")
         return t, {"inline_keyboard": [[ak_btn(AK_NAV_BACK, "a:back"), ak_btn("✍️ Вручную", "a:m:manual")], [ak_btn(AK_NAV_X, "a:cancel")]]}
     nav = lambda nxt=True: [ak_btn(AK_NAV_BACK, "a:back")] + ([ak_btn(AK_NAV_NEXT, "a:next")] if nxt else [])
