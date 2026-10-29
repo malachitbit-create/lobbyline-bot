@@ -1618,7 +1618,7 @@ def ak_steam_link(chat, uid, text):
         else: d["err"] = err
         save_state(s); d = json.loads(json.dumps(d))
     ak_show(chat, d.get("mid"), d, new_step=bool(res))
-def render_banner(step, n=None, total=6):
+def render_banner(step, n=None, total=6, intro=False):
     """Holographic LL banner in the avatar style for one questionnaire step."""
     from PIL import Image, ImageDraw, ImageFilter
     import io, colorsys
@@ -1640,7 +1640,8 @@ def render_banner(step, n=None, total=6):
         for x in range(x0, x1):
             h = (t0 + (x - x0) / 900) % 1; r, g, b = colorsys.hsv_to_rgb(h, .32, 1)
             d.line((x, y0, x, y1), fill=(int(r * 255), int(g * 255), int(b * 255)))
-    d.text((420, 92), f"АНКЕТА LOBBY LINE · ШАГ {n} ИЗ {total}", font=_font(26, 600), fill=(150, 190, 235))
+    if intro: n, total, title = total, total, "Анкета игрока"
+    d.text((420, 92), "LOBBY LINE · АНКЕТЫ УЧАСТНИКОВ" if intro else f"АНКЕТА LOBBY LINE · ШАГ {n} ИЗ {total}", font=_font(26, 600), fill=(150, 190, 235))
     d.text((418, 132), title, font=_font(78, 700), fill=(244, 244, 250))
     sx, gap = 420, 14; sw = (850 - gap * (total - 1)) // total
     for i in range(total):
@@ -1652,7 +1653,7 @@ def render_banner(step, n=None, total=6):
                 r, g, b = colorsys.hsv_to_rgb(((x - sx) / 850 + .55) % 1, .35, 1); hd.line((x, 270, x, 292), fill=(int(r * 255), int(g * 255), int(b * 255)))
             im.paste(hl, (0, 0), m); d = ImageDraw.Draw(im)
         else: d.rounded_rectangle(box, 11, outline=(70, 78, 110), width=2, fill=(14, 16, 30))
-    d.text((420, 322), "заполни за минуту — карточка соберётся сама", font=_font(24, 400), fill=(130, 134, 160))
+    d.text((420, 322), "Steam-ссылка или вручную — карточка соберётся сама" if intro else "заполни за минуту — карточка соберётся сама", font=_font(24, 400), fill=(130, 134, 160))
     b = io.BytesIO(); im.save(b, "PNG"); return b.getvalue()
 AK_BANNER_IDS = {}   # step -> Telegram file_id once uploaded (in memory)
 def ak_banner_media(d, caption):
@@ -2009,6 +2010,7 @@ def on_update(u):
                     tg("deleteMessage", chat_id=msg["chat"]["id"], message_id=msg["message_id"])
             return
         dcmd = txt.split(" ")[0].split("@")[0] if txt.startswith("/") else ""
+        if txt.strip() in ("/start anketa", "/start@" + str(BOT_UN[0]) + " anketa"): dcmd = "/anketa"
         if txt and not dcmd and (s.get("anketa_draft", {}).get(str(chat)) or {}).get("step") == "link":
             return POOL.submit(_safe, "steamlink", ak_steam_link, chat, chat, txt)
         if dcmd in ("/anketa", "/profile") or txt.strip() == "/start anketa":
