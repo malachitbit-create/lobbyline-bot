@@ -8,14 +8,13 @@ os.environ.setdefault("DATA_DIR", "/tmp/akdata"); os.makedirs(os.path.join(os.en
 import bot
 GROUP, THREAD, OWNER = -1004495233101, 86, 5856323609
 TEXT = ("🪐 <b>Анкета игрока Lobby Line</b>\n\n"
-        "Расскажи, во что и когда играешь — соберём тебе стильную карточку ✨\n\n"
+        "Расскажи, во что и когда играешь — соберём тебе стильную карточку ✨\nЖми кнопку ниже: анкета откроется прямо здесь, в этой теме 👇\n\n"
         "🔗 Кинь ссылку на Steam — уровень и часы подтянутся сами\n"
         "✍️ Или отметь всё кнопками вручную\n"
         "🎭 Роли и позиции · 🕰 удобное время (МСК)\n\n"
         "Чужую анкету смотри командой /profile @ник 👀")
 def markup():
-    un = bot.tg("getMe")["result"]["username"]
-    return {"inline_keyboard": [[{"text": "📝 Анкета", "url": f"https://t.me/{un}?start=anketa", "style": "primary"}]]}
+    return {"inline_keyboard": [[{"text": "📝 Анкета", "callback_data": "a:go", "style": "primary"}]]}
 def send(chat, **extra):
     png = bot.render_banner("mode", 1, 7, intro=True)
     return bot.tg("sendPhoto", files={"photo": ("anketa_post.png", png, "image/png")}, chat_id=chat, caption=TEXT,

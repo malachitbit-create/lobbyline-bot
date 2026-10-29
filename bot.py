@@ -1716,7 +1716,8 @@ def ak_view(d):
 
 def ak_show(chat, mid, d, pre="", new_step=True):
     """Show step d as banner photo + caption; edits mid in place when possible. Returns message_id."""
-    t, m = ak_view(d); t = pre + t
+    t, m = ak_view(d); t = (d.get("who") or "") + pre + t
+    if d.get("th") and mid: del_later(chat, mid, 900)   # abandoned group questionnaire disappears after 15 min idle
     if mid and not new_step:
         j = tg("editMessageCaption", chat_id=chat, message_id=mid, caption=t, parse_mode="HTML", reply_markup=m)
         if j.get("ok") or "not modified" in (j.get("description") or ""): return mid
@@ -1727,9 +1728,11 @@ def ak_show(chat, mid, d, pre="", new_step=True):
         if "not modified" in (j.get("description") or ""): return mid
     f, media = ak_banner_media(d, t)
     kw = {"photo": media["media"]} if not f else {}
+    if d.get("th"): kw.update(message_thread_id=d["th"], disable_notification=True)
     j = tg("sendPhoto", files={"photo": f["p"]} if f else None, chat_id=chat, caption=t, parse_mode="HTML", reply_markup=m, **kw)
-    ak_remember(d, j)
-    return j.get("result", {}).get("message_id")
+    ak_remember(d, j); nm = j.get("result", {}).get("message_id")
+    if d.get("th") and nm: del_later(chat, nm, 900)
+    return nm
 
 def ak_days_text(days):
     idx = sorted(AK_DAYS.index(x) for x in days if x in AK_DAYS)
@@ -1807,14 +1810,17 @@ def ak_edit_or_send(chat, mid, text, markup):
     j = tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML", reply_markup=markup)
     return j.get("result", {}).get("message_id")
 
-def anketa_start(chat, fu):
+def anketa_start(chat, fu, th=None):
     uid = fu["id"]
     with lock:
         s = load_state(); old = s.get("anketas", {}).get(str(uid)) or {}
+        prevd = s.get("anketa_draft", {}).get(str(uid)) or {}
         d = {k: json.loads(json.dumps(old.get(k))) for k in ("lvl", "games", "hours", "roles", "days", "slots") if old.get(k) is not None}
         d["lvl"] = AK_LEVELS.index(d["lvl"]) if d.get("lvl") in AK_LEVELS else None
-        d.update(step="mode", gi=0, mid=None, src=None, err=None); s.setdefault("anketa_draft", {})[str(uid)] = d; save_state(s)
+        d.update(step="mode", gi=0, mid=None, src=None, err=None, chat=chat, th=th,
+                 who=f"👤 <b>{html.escape(ak_nick(fu))}</b> заполняет анкету\n\n" if th else ""); s.setdefault("anketa_draft", {})[str(uid)] = d; save_state(s)
     pre = "✏️ <i>Анкета уже есть — проходим заново, прежние ответы отмечены ✅</i>\n\n" if old else ""
+    if prevd.get("mid") and prevd.get("chat"): tg("deleteMessage", chat_id=prevd["chat"], message_id=prevd["mid"])
     mid = ak_show(chat, None, d, pre)
     with lock:
         s = load_state(); dd = s.get("anketa_draft", {}).get(str(uid))
@@ -1843,11 +1849,20 @@ def anketa_finish(q, d):
          "updated": int(time.time())}
     with lock:
         s = load_state(); old = s.setdefault("anketas", {}).get(str(uid)) or {}
-        a["dm"] = old.get("dm"); a["pub"] = old.get("pub"); s["anketas"][str(uid)] = a
+        a["dm"] = old.get("dm"); a["pub"] = old.get("pub"); a["topic"] = old.get("topic"); s["anketas"][str(uid)] = a
         s.get("anketa_draft", {}).pop(str(uid), None); save_state(s)
     png = render_anketa(a); cap = anketa_caption(a)
     mk = {"inline_keyboard": [[ak_btn("✏️ Изменить анкету", "a:start")]]}
     if d.get("mid"): tg("deleteMessage", chat_id=chat, message_id=d["mid"])
+    if d.get("th"):   # filled in the «Анкеты» topic: the card lives there, a re-fill replaces the old card
+        for old_m in {(a.get("topic") or {}).get("mid"), (a.get("pub") or {}).get("mid")} - {None}:
+            tg("deleteMessage", chat_id=chat, message_id=old_m)
+        j = tg("sendPhoto", files={"photo": ("anketa.png", png, "image/png")}, chat_id=chat, message_thread_id=d["th"], caption=cap,
+               parse_mode="HTML", disable_notification=True, reply_markup={"inline_keyboard": [[ak_btn("📝 Заполнить / изменить свою", "a:go")]]})
+        with lock:
+            s = load_state(); x = s.get("anketas", {}).get(str(uid))
+            if x and j.get("ok"): x["topic"] = {"mid": j["result"]["message_id"]}; x["pub"] = None; save_state(s)
+        log.info("anketa card in topic for %s (%d games)", uid, len(a["games"])); return
     dm = a.get("dm") or {}; ok = False
     if dm.get("mid") and dm.get("chat") == chat:  # repeat /anketa edits the existing card
         j = tg("editMessageMedia", files={"p": ("anketa.png", png, "image/png")}, chat_id=chat, message_id=dm["mid"],
@@ -1865,8 +1880,18 @@ def anketa_finish(q, d):
 
 def on_anketa_btn(q):
     uid = q["from"]["id"]; data = q["data"][2:]; chat = q["message"]["chat"]["id"]
-    if q["message"]["chat"].get("type") != "private": return tg("answerCallbackQuery", callback_query_id=q["id"])
-    if data == "start":
+    grp = q["message"]["chat"].get("type") != "private"
+    if grp:
+        s0 = load_state(); th = q["message"].get("message_thread_id")
+        if chat != s0.get("group") or not s0.get("anketa_thread") or th != s0.get("anketa_thread"):
+            return tg("answerCallbackQuery", callback_query_id=q["id"])
+        if data in ("go", "start"):
+            tg("answerCallbackQuery", callback_query_id=q["id"], text="Начинаем! Анкета появится ниже 👇"); return anketa_start(chat, q["from"], th)
+        d0 = s0.get("anketa_draft", {}).get(str(uid)) or {}
+        if d0.get("mid") != q["message"]["message_id"]:
+            return tg("answerCallbackQuery", callback_query_id=q["id"], show_alert=True,
+                      text="🙂 Это анкета другого участника. Нажми «📝 Анкета» в закрепе, чтобы заполнить свою.")
+    elif data in ("go", "start"):
         tg("answerCallbackQuery", callback_query_id=q["id"]); return anketa_start(chat, q["from"])
     with lock:
         s = load_state(); d = s.get("anketa_draft", {}).get(str(uid))
@@ -1877,6 +1902,7 @@ def on_anketa_btn(q):
         if act == "cancel":
             s["anketa_draft"].pop(str(uid)); save_state(s)
             tg("answerCallbackQuery", callback_query_id=q["id"], text="Отменено")
+            if grp: return tg("deleteMessage", chat_id=chat, message_id=d["mid"])
             return tg("editMessageCaption", chat_id=chat, message_id=d["mid"], caption="✖ Анкета отменена. Вернуться можно в любой момент: /anketa", reply_markup={"inline_keyboard": []})
         if act == "m":
             if arg == "steam" and not STEAM_KEY:
@@ -1969,6 +1995,16 @@ def anketa_group_cmd(msg, s, cmd):
     if j.get("ok"): del_later(chat, j["result"]["message_id"], 120)
 
 BOT_UN = [None]
+def anketa_topic_msg(msg, s):
+    """«Анкеты» topic stays clean: only the pinned post, cards and live questionnaires. Steam links are read, then removed."""
+    chat = msg["chat"]["id"]; uid = (msg.get("from") or {}).get("id"); txt = msg.get("text") or ""
+    d = s.get("anketa_draft", {}).get(str(uid)) or {}
+    if txt and not txt.startswith("/") and d.get("step") == "link" and d.get("chat") == chat:
+        POOL.submit(_safe, "steamlink", ak_steam_link, chat, uid, txt)
+    elif txt.startswith("/profile"): anketa_group_cmd(msg, s, "/profile")
+    elif txt.startswith("/anketa"):
+        tg("deleteMessage", chat_id=chat, message_id=msg["message_id"]); return anketa_start(chat, msg["from"], msg["message_thread_id"])
+    tg("deleteMessage", chat_id=chat, message_id=msg["message_id"])
 def ensure_anketa_topic():
     s = load_state()
     if s.get("anketa_thread") or not s.get("group"): return s.get("anketa_thread")
@@ -1989,6 +2025,9 @@ def on_update(u):
     if "message" in u:
         msg = u["message"]; chat = msg["chat"]["id"]; txt = msg.get("text", "")
         if msg["chat"]["type"] != "private":
+            if msg["chat"]["type"] == "supergroup" and chat == s.get("group") and s.get("anketa_thread") \
+                    and msg.get("is_topic_message") and msg.get("message_thread_id") == s.get("anketa_thread"):
+                return anketa_topic_msg(msg, s)
             if msg["chat"]["type"] == "supergroup":
                 handle_group(msg, s)
                 t0 = msg.get("text") or ""
